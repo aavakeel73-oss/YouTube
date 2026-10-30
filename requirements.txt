@@ -1,0 +1,10 @@
+# StreamRip Pro — Python 3 Backend Dependencies
+# Note: The core backend (backend/app.py & backend/media_engine.py) is engineered
+# to run with zero external pip dependencies using Python 3 standard library +
+# standalone yt-dlp + system FFmpeg/FFprobe, and also supports FastAPI/Flask/uvicorn deployments.
+yt-dlp>=2026.10.26
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+flask>=3.1.0
+gunicorn>=23.0.0
+pytest>=8.3.0
