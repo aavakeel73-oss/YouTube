@@ -1,0 +1,6 @@
+{
+  "name": "StreamRip Pro",
+  "description": "Professional full-stack YouTube media analysis, video stream merging, and audio extraction workstation powered by Python 3, yt-dlp, FFmpeg, and FFprobe.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
