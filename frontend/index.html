@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>StreamRip Pro — Standalone HTML5 Interface</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">StreamRip Pro</div>
+    <nav class="nav-links">
+      <a href="#workspace">Workspace</a>
+      <a href="#diagnostics">HTTP 403 Diagnostics</a>
+      <a href="#admin">Admin Monitor</a>
+    </nav>
+    <button id="langToggle" class="btn-secondary">English / हिन्दी</button>
+  </header>
+
+  <main class="container">
+    <section id="workspace" class="hero-card">
+      <h1 id="heroTitle">Authorized YouTube Media Processor & FFmpeg Workstation</h1>
+      <p id="heroSub">Validate URLs, inspect genuine stream resolutions, merge video+audio via FFmpeg, and verify container integrity with FFprobe.</p>
+
+      <form id="analyzeForm" class="url-form">
+        <input
+          type="url"
+          id="urlInput"
+          placeholder="Paste YouTube Video, Shorts, or youtu.be URL..."
+          required
+        />
+        <button type="submit" id="analyzeBtn" class="btn-primary">Analyze Media</button>
+      </form>
+      <div id="errorBox" class="error-box hidden"></div>
+      <div id="resultBox" class="result-box hidden"></div>
+      <div id="progressBox" class="progress-box hidden">
+        <div class="progress-header">
+          <span id="progressStage">Initializing...</span>
+          <span id="progressPct" class="mono">0%</span>
+        </div>
+        <div class="progress-track">
+          <div id="progressBar" class="progress-fill" style="width: 0%"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
