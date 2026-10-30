@@ -298,41 +298,6 @@ class StreamRipRequestHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 
-        # Serve the compiled React application without interfering with API routes.
-        if not path.startswith("/api/"):
-            dist_root = os.path.realpath(os.path.join(PROJECT_ROOT, "dist"))
-            requested = urllib.parse.unquote(path).lstrip("/") or "index.html"
-            candidate = os.path.realpath(os.path.join(dist_root, requested))
-            within_dist = candidate == dist_root or candidate.startswith(dist_root + os.sep)
-            if within_dist and os.path.isfile(candidate):
-                static_file = candidate
-            elif "." not in os.path.basename(path) and os.path.isfile(os.path.join(dist_root, "index.html")):
-                # React client-side route fallback; never use for missing assets.
-                static_file = os.path.join(dist_root, "index.html")
-            else:
-                static_file = None
-
-            if static_file:
-                mime_type = mimetypes.guess_type(static_file)[0] or "application/octet-stream"
-                if static_file.endswith(".html"):
-                    mime_type = "text/html; charset=utf-8"
-                size = os.path.getsize(static_file)
-                self.send_response(200)
-                self.send_header("Content-Type", mime_type)
-                self.send_header("Content-Length", str(size))
-                self.send_header("Cache-Control", "no-cache" if static_file.endswith(".html") else "public, max-age=3600")
-                self.end_headers()
-                try:
-                    with open(static_file, "rb") as source:
-                        while True:
-                            chunk = source.read(65536)
-                            if not chunk:
-                                break
-                            self.wfile.write(chunk)
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
-                return
-
         if path == "/api/health":
             bins = engine.get_binary_versions()
             storage = engine.get_storage_utilization()
@@ -415,4 +380,340 @@ class StreamRipRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
 
-            query = urllib.parse.pars
+            query = urllib.parse.parse_qs(parsed.query)
+            inline_mode = query.get("inline", ["0"])[0] == "1"
+            filename = job.get("filename") or os.path.basename(file_path)
+            mime_type, _ = mimetypes.guess_type(filename)
+            if not mime_type:
+                mime_type = "video/mp4" if filename.endswith(".mp4") else "audio/mpeg"
+
+            file_size = os.path.getsize(file_path)
+            disposition = "inline" if inline_mode else "attachment"
+
+            # Support HTTP Range requests for mobile Chrome / HTML5 media playback
+            range_header = self.headers.get("Range")
+            if range_header and range_header.startswith("bytes="):
+                try:
+                    range_spec = range_header.split("=", 1)[1]
+                    start_str, end_str = range_spec.split("-", 1)
+                    start_byte = int(start_str) if start_str else 0
+                    end_byte = int(end_str) if end_str else file_size - 1
+                    end_byte = min(end_byte, file_size - 1)
+                    chunk_len = (end_byte - start_byte) + 1
+
+                    self.send_response(206)
+                    self.send_header("Content-Type", mime_type)
+                    self.send_header("Content-Length", str(chunk_len))
+                    self.send_header("Content-Range", f"bytes {start_byte}-{end_byte}/{file_size}")
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Content-Disposition", f'{disposition}; filename="{filename}"')
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD")
+                    self.send_header("Access-Control-Allow-Headers", "Range, Content-Type, Authorization, X-StreamRip-Session, *")
+                    self.send_header("Access-Control-Expose-Headers", "Content-Length, Content-Range, Content-Disposition, Accept-Ranges, X-StreamRip-Job-Id, X-StreamRip-Verified-Bytes")
+                    self.send_header("X-StreamRip-Job-Id", job_id)
+                    self.send_header("X-StreamRip-Verified-Bytes", str(file_size))
+                    self.end_headers()
+
+                    with open(file_path, "rb") as f:
+                        f.seek(start_byte)
+                        remaining = chunk_len
+                        while remaining > 0:
+                            data = f.read(min(1048576, remaining))
+                            if not data:
+                                break
+                            self.wfile.write(data)
+                            remaining -= len(data)
+                    return
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                except Exception as exc:
+                    return
+
+            self.send_response(200)
+            self.send_header("Content-Type", mime_type)
+            self.send_header("Content-Length", str(file_size))
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Disposition", f'{disposition}; filename="{filename}"')
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD")
+            self.send_header("Access-Control-Allow-Headers", "Range, Content-Type, Authorization, X-StreamRip-Session, *")
+            self.send_header("Access-Control-Expose-Headers", "Content-Length, Content-Range, Content-Disposition, Accept-Ranges, X-StreamRip-Job-Id, X-StreamRip-Verified-Bytes")
+            self.send_header("X-StreamRip-Job-Id", job_id)
+            self.send_header("X-StreamRip-Verified-Bytes", str(file_size))
+            self.end_headers()
+
+            try:
+                with open(file_path, "rb") as f:
+                    while True:
+                        chunk = f.read(1048576)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+
+        self._send_json(404, build_diagnostic_response(404, "ENDPOINT_NOT_FOUND"))
+
+    def do_HEAD(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        if path.startswith("/api/download/") or path.startswith("/api/file/"):
+            prefix = "/api/download/" if path.startswith("/api/download/") else "/api/file/"
+            job_id = path.split(prefix, 1)[1].strip("/")
+            job = engine.get_job(job_id)
+            if not job or job.get("status") != "completed":
+                self.send_response(404)
+                self.end_headers()
+                return
+            file_path = job.get("output_path")
+            if not file_path or not os.path.exists(file_path):
+                self.send_response(404)
+                self.end_headers()
+                return
+            filename = job.get("filename") or os.path.basename(file_path)
+            mime_type, _ = mimetypes.guess_type(filename)
+            if not mime_type:
+                mime_type = "video/mp4" if filename.endswith(".mp4") else "audio/mpeg"
+            file_size = os.path.getsize(file_path)
+            self.send_response(200)
+            self.send_header("Content-Type", mime_type)
+            self.send_header("Content-Length", str(file_size))
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("X-StreamRip-Job-Id", job_id)
+            self.send_header("X-StreamRip-Verified-Bytes", str(file_size))
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.end_headers()
+
+    def do_POST(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+
+        client_ip = self._get_client_ip()
+        allowed, retry_after = rate_limiter.check_allowed(client_ip)
+        if not allowed:
+            engine.record_error(429)
+            self._send_json(
+                429,
+                build_diagnostic_response(
+                    status_code=429,
+                    error_code="RATE_LIMIT_EXCEEDED",
+                    custom_message_en=f"Rate limit exceeded. Please wait {retry_after} seconds before sending another request.",
+                    custom_message_hi=f"अनुरोध सीमा पार हो गई। कृपया नया अनुरोध भेजने से पहले {retry_after} सेकंड प्रतीक्षा करें।",
+                ),
+                extra_headers={"Retry-After": str(retry_after)},
+            )
+            return
+
+        try:
+            body = self._read_json_body()
+        except Exception as exc:
+            engine.record_error(400)
+            self._send_json(
+                400,
+                build_diagnostic_response(
+                    status_code=400,
+                    error_code="INVALID_JSON_PAYLOAD",
+                    custom_message_en=f"Invalid JSON request body: {exc}",
+                    custom_message_hi="अमान्य JSON अनुरोध पेलोड।",
+                ),
+            )
+            return
+
+        if path == "/api/analyze":
+            raw_url = str(body.get("url") or "")
+            strict_live = bool(body.get("strict_live_only", False))
+            simulate_diag = body.get("simulate_diagnostic")
+            status_code, response_data = engine.analyze_url(
+                raw_url=raw_url,
+                strict_live_only=strict_live,
+                simulate_diagnostic=simulate_diag,
+            )
+            self._send_json(status_code, response_data)
+            return
+
+        # Support both POST /api/jobs and POST /api/download
+        if path in ("/api/jobs", "/api/download"):
+            import base64
+            raw_url = str(body.get("url") or "")
+            mode = str(body.get("mode") or "video")
+            quality_id = str(body.get("quality_id") or body.get("quality") or "720p")
+            audio_format = str(body.get("audio_format") or "mp3")
+            audio_bitrate = str(body.get("audio_bitrate") or "192k")
+            inline_blob = bool(body.get("inline_blob", False))
+
+            status_code, response_data = engine.create_download_job(
+                raw_url=raw_url,
+                mode=mode,
+                quality_id=quality_id,
+                audio_format=audio_format,
+                audio_bitrate=audio_bitrate,
+            )
+
+            if status_code == 202 and inline_blob and response_data.get("job_id"):
+                jid = response_data["job_id"]
+                for _ in range(70):
+                    time.sleep(0.05)
+                    latest = engine.get_job(jid)
+                    if latest and latest.get("status") in ("completed", "failed"):
+                        response_data = dict(latest)
+                        break
+
+                if response_data.get("status") == "completed":
+                    fpath = response_data.get("output_path")
+                    if fpath and os.path.exists(fpath):
+                        fname = response_data.get("filename") or os.path.basename(fpath)
+                        mtype, _ = mimetypes.guess_type(fname)
+                        if not mtype:
+                            mtype = "video/mp4" if fname.endswith(".mp4") else "audio/mpeg"
+                        fsize = os.path.getsize(fpath)
+                        # Zero silent truncation:
+                        # For files <= 50 MB, base64 inline delivery is safe without browser heap exhaustion.
+                        # For files > 50 MB, do NOT truncate to 25 MB! Instead, direct streaming (/api/download/<job_id>)
+                        # must be used so 100% of the original video bytes are delivered directly to disk.
+                        if fsize <= 50 * 1024 * 1024:
+                            with open(fpath, "rb") as bf:
+                                rbytes = bf.read()
+                            response_data["inline_blob_data"] = {
+                                "job_id": jid,
+                                "filename": fname,
+                                "mime_type": mtype,
+                                "size_bytes": fsize,
+                                "base_stream_bytes": len(rbytes),
+                                "target_size_bytes": int(response_data.get("target_size_bytes") or fsize),
+                                "container_ext": str(response_data.get("container_ext") or "mp4").lower(),
+                                "base64_data": base64.b64encode(rbytes).decode("ascii"),
+                            }
+                        else:
+                            response_data["direct_download_url"] = f"/api/download/{jid}"
+
+            self._send_json(status_code, response_data)
+            return
+
+        if path == "/api/admin/cleanup":
+            res = engine.cleanup_temp_files(force_all=True)
+            self._send_json(
+                200,
+                {
+                    "status": "cleaned",
+                    **res,
+                    "storage": engine.get_storage_utilization(),
+                },
+            )
+            return
+
+        if path == "/api/cookies":
+            cookies_text = str(body.get("cookies_text") or "").strip()
+            if not cookies_text:
+                self._send_json(400, {"error": "Cookie content cannot be empty"})
+                return
+            c_path = os.path.join("/tmp/streamrip_pro_media", "cookies.txt")
+            with open(c_path, "w", encoding="utf-8") as f:
+                f.write(cookies_text)
+            self._send_json(200, {"success": True, "has_cookies": True, "file_size_bytes": len(cookies_text.encode())})
+            return
+
+        if path == "/api/cookies/clear":
+            c_path = os.path.join("/tmp/streamrip_pro_media", "cookies.txt")
+            if os.path.exists(c_path):
+                try:
+                    os.remove(c_path)
+                except OSError:
+                    pass
+            self._send_json(200, {"success": True, "has_cookies": False})
+            return
+
+        if path == "/api/qa/run-suite":
+            suite_report = run_qa_verification_suite()
+            self._send_json(200, suite_report)
+            return
+
+        if path == "/api/download-blob":
+            import base64
+            job_id = str(body.get("job_id") or "").strip()
+            job = engine.get_job(job_id)
+            if not job or job.get("status") != "completed":
+                self._send_json(
+                    404,
+                    build_diagnostic_response(
+                        status_code=404,
+                        error_code="DOWNLOAD_FILE_NOT_READY",
+                        custom_message_en="Requested media file is not ready or has expired.",
+                        custom_message_hi="अनुरोधित मीडिया फ़ाइल तैयार नहीं है या समाप्त हो गई है।",
+                    ),
+                )
+                return
+
+            file_path = job.get("output_path")
+            if not file_path or not os.path.exists(file_path):
+                self._send_json(
+                    404,
+                    build_diagnostic_response(
+                        status_code=404,
+                        error_code="FILE_EXPIRED_ON_DISK",
+                        custom_message_en="Temporary media file has expired on disk.",
+                        custom_message_hi="अस्थायी मीडिया फ़ाइल डिस्क से समाप्त हो गई है।",
+                    ),
+                )
+                return
+
+            filename = job.get("filename") or os.path.basename(file_path)
+            mime_type, _ = mimetypes.guess_type(filename)
+            if not mime_type:
+                mime_type = "video/mp4" if filename.endswith(".mp4") else "audio/mpeg"
+
+            full_file_size = os.path.getsize(file_path)
+
+            # Never silently truncate to 25 MB! (Requirement 8)
+            # If the file exceeds 50 MB, base64 transfer is dangerous for browser memory.
+            # Return explicit DIRECT_STREAM_REQUIRED error pointing to /api/download/<job_id>
+            # rather than silently cutting the file!
+            if full_file_size > 50 * 1024 * 1024:
+                file_mb = round(full_file_size / (1024 * 1024), 2)
+                self._send_json(
+                    413,
+                    build_diagnostic_response(
+                        status_code=413,
+                        error_code="DIRECT_STREAM_REQUIRED",
+                        custom_message_en=f"File is {file_mb} MB. Base64 transfer limit is 50 MB. Use direct HTTP streaming (/api/download/{job_id}) to download full file without truncation.",
+                        custom_message_hi=f"फ़ाइल का आकार {file_mb} MB है। चुपचाप 25 MB में छोटा करने के बजाय, पूरा वीडियो डाउनलोड करने के लिए सीधा डाउनलोड (/api/download/{job_id}) उपयोग करें।",
+                    ),
+                )
+                return
+
+            with open(file_path, "rb") as f:
+                raw_bytes = f.read()
+
+            b64_data = base64.b64encode(raw_bytes).decode("ascii")
+            self._send_json(
+                200,
+                {
+                    "job_id": job_id,
+                    "filename": filename,
+                    "mime_type": mime_type,
+                    "size_bytes": full_file_size,
+                    "base_stream_bytes": len(raw_bytes),
+                    "target_size_bytes": int(job.get("target_size_bytes") or full_file_size),
+                    "container_ext": str(job.get("container_ext") or "mp4").lower(),
+                    "base64_data": b64_data,
+                },
+            )
+            return
+
+        self._send_json(404, build_diagnostic_response(404, "ENDPOINT_NOT_FOUND"))
+
+
+def run_server(host: str = "127.0.0.1", port: int = 5001) -> None:
+    ThreadingHTTPServer.allow_reuse_address = True
+    server = ThreadingHTTPServer((host, port), StreamRipRequestHandler)
+    print(f"[StreamRip Pro Python Engine] Listening on http://{host}:{port}", flush=True)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    port_num = int(os.environ.get("PYTHON_BACKEND_PORT", "5001"))
+    run_server(host="0.0.0.0", port=port_num)
