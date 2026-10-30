@@ -3,7 +3,7 @@
 FROM node:22-bookworm-slim AS frontend
 WORKDIR /build
 COPY . .
-RUN npm install && npm run build
+RUN npm install --legacy-peer-deps && npm run build
 
 # Python backend and FFmpeg
 FROM python:3.12-slim-bookworm
