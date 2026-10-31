@@ -1978,13 +1978,13 @@ class MediaEngine:
                             custom_message_en=(
                                 f"YouTube cloud bot challenge ('Sign in to confirm you’re not a bot') prevented downloading '{job.get('title')}'. "
                                 f"To ensure 100% video integrity and avoid truncated 5-second or 25 MB files, download was halted. "
-                                f"Use the green 'Direct 1080p (Mirror 1)' button to download the full {job.get('duration_formatted')} original video directly to your phone, "
-                                f"or provide cookies.txt."
+                                f"The upstream server denied media access. Retry later or use an official, authorized download source. "
+                                f"No direct-download mirror is guaranteed."
                             ),
                             custom_message_hi=(
                                 f"YouTube ने इस वीडियो ('{job.get('title')}') को क्लाउड सर्वर पर ब्लॉक कर दिया है (Sign in to confirm you’re not a bot)। "
                                 f"अधूरा 5 सेकंड या 25 MB का खराब वीडियो बनाने के बजाय डाउनलोड सुरक्षित रूप से रोक दिया गया है। "
-                                f"पूरा {job.get('duration_formatted')} मिनट का 100% 1080p वीडियो अपने मोबाइल पर सीधा डाउनलोड करने के लिए ऊपर हरे 'सीधा 1080p डाउनलोड (Mirror 1)' बटन का उपयोग करें, या cookies.txt जोड़ें।"
+                                f"स्रोत सर्वर ने मीडिया एक्सेस रोक दिया है। बाद में फिर प्रयास करें या अधिकृत आधिकारिक डाउनलोड विकल्प का उपयोग करें। कोई 1080p मिरर गारंटी नहीं है।"
                             ),
                         ),
                     )
