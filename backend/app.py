@@ -12,6 +12,7 @@ Provides REST endpoints for:
 """
 
 import json
+import logging
 import mimetypes
 import os
 import sys
@@ -28,6 +29,9 @@ if PROJECT_ROOT not in sys.path:
 from backend.diagnostics import YOUTUBE_403_SUBTYPES, build_diagnostic_response
 from backend.media_engine import MediaEngine
 from backend.security import RateLimiter, validate_and_parse_youtube_url
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("streamrip.api")
 
 engine = MediaEngine()
 rate_limiter = RateLimiter(max_requests=60, window_seconds=60)
@@ -251,8 +255,7 @@ class StreamRipRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, format: str, *args: Any) -> None:
-        # Keep stdout clean and structured
-        pass
+        logger.info("request client=%s message=%s", self.client_address[0], (format % args).split("?")[0])
 
     def _send_json(self, status_code: int, payload: Dict[str, Any], extra_headers: Optional[Dict[str, str]] = None) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -533,6 +536,8 @@ class StreamRipRequestHandler(BaseHTTPRequestHandler):
                 strict_live_only=strict_live,
                 simulate_diagnostic=simulate_diag,
             )
+            if status_code >= 400:
+                logger.warning("analyze failed status=%s code=%s", status_code, response_data.get("error_code"))
             self._send_json(status_code, response_data)
             return
 
@@ -591,6 +596,8 @@ class StreamRipRequestHandler(BaseHTTPRequestHandler):
                         else:
                             response_data["direct_download_url"] = f"/api/download/{jid}"
 
+            if status_code >= 400:
+                logger.warning("job failed status=%s code=%s", status_code, response_data.get("error_code"))
             self._send_json(status_code, response_data)
             return
 
