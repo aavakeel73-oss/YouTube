@@ -1,50 +1,18 @@
-<!DOCTYPE html>
-<html lang="en" class="dark">
+<!doctype html>
+<html lang="hi" class="dark">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>StreamRip Pro — Standalone HTML5 Interface</title>
-  <link rel="stylesheet" href="styles.css" />
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#070c18"><title>StreamRip Pro | Video Workspace</title>
+<link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">StreamRip Pro</div>
-    <nav class="nav-links">
-      <a href="#workspace">Workspace</a>
-      <a href="#diagnostics">HTTP 403 Diagnostics</a>
-      <a href="#admin">Admin Monitor</a>
-    </nav>
-    <button id="langToggle" class="btn-secondary">English / हिन्दी</button>
-  </header>
-
-  <main class="container">
-    <section id="workspace" class="hero-card">
-      <h1 id="heroTitle">Authorized YouTube Media Processor & FFmpeg Workstation</h1>
-      <p id="heroSub">Validate URLs, inspect genuine stream resolutions, merge video+audio via FFmpeg, and verify container integrity with FFprobe.</p>
-
-      <form id="analyzeForm" class="url-form">
-        <input
-          type="url"
-          id="urlInput"
-          placeholder="Paste YouTube Video, Shorts, or youtu.be URL..."
-          required
-        />
-        <button type="submit" id="analyzeBtn" class="btn-primary">Analyze Media</button>
-      </form>
-      <div id="errorBox" class="error-box hidden"></div>
-      <div id="resultBox" class="result-box hidden"></div>
-      <div id="progressBox" class="progress-box hidden">
-        <div class="progress-header">
-          <span id="progressStage">Initializing...</span>
-          <span id="progressPct" class="mono">0%</span>
-        </div>
-        <div class="progress-track">
-          <div id="progressBar" class="progress-fill" style="width: 0%"></div>
-        </div>
-      </div>
-    </section>
-  </main>
-
-  <script src="app.js"></script>
-</body>
-</html>
+<header class="topbar"><div class="brand"><span class="brand-icon">▶</span><span>StreamRip <em>Pro</em></span></div><button id="langToggle" class="btn-secondary" type="button">English</button></header>
+<main class="container"><section class="hero-card" id="workspace">
+<div class="eyebrow">VIDEO WORKSPACE</div><h1 id="heroTitle">वीडियो डाउनलोड वर्कस्पेस</h1><p id="heroSub">अपने अधिकार वाले वीडियो का लिंक डालें, उपलब्ध क्वालिटी चुनें और प्रोसेसिंग देखें।</p>
+<form id="analyzeForm" class="url-form"><label for="urlInput">वीडियो लिंक</label><div class="input-wrap"><input id="urlInput" type="url" placeholder="YouTube वीडियो या Shorts लिंक पेस्ट करें" required autocomplete="url"><button id="pasteBtn" type="button" class="btn-secondary">Paste</button></div><button id="analyzeBtn" type="submit" class="btn-primary">वीडियो चेक करें</button></form>
+<div id="errorBox" class="error-box hidden" role="alert"></div>
+<section id="resultBox" class="result-box hidden" aria-live="polite"><div class="media-heading"><img id="thumbnail" class="thumbnail hidden" alt="वीडियो थंबनेल"><div><h2 id="videoTitle"></h2><p id="videoMeta"></p></div></div><label for="qualitySelect" id="qualityLabel">वीडियो क्वालिटी</label><select id="qualitySelect"></select><button id="downloadBtn" class="btn-primary" type="button">डाउनलोड शुरू करें</button></section>
+<section id="progressBox" class="progress-box hidden" aria-live="polite"><div class="progress-header"><strong id="progressStage">तैयार हो रहा है…</strong><span id="progressPct" class="mono">0%</span></div><div class="progress-track" role="progressbar" aria-label="डाउनलोड प्रगति" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progressTrack"><div id="progressBar" class="progress-fill"></div></div><p id="progressHint">सर्वर से स्थिति प्राप्त की जा रही है…</p></section>
+<section id="completedBox" class="completed-box hidden"><div class="success">✓ वीडियो तैयार है</div><video id="videoPlayer" controls playsinline preload="metadata" class="hidden"></video><div class="completed-actions"><a id="saveLink" class="btn-primary" href="#" download>वीडियो सेव करें</a><button id="newBtn" class="btn-secondary" type="button">नया वीडियो</button></div><p class="fineprint">वीडियो सेव करने पर ब्राउज़र डाउनलोड शुरू करेगा। डिवाइस पर सेव पूरा होने की स्थिति ब्राउज़र दिखाएगा।</p></section>
+</section><p class="footer-note">StreamRip Pro · केवल उन्हीं वीडियो को प्रोसेस करें जिनके लिए आपके पास अनुमति है।</p></main><script src="app.js" defer></script>
+</body></html>

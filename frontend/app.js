@@ -1,47 +1,23 @@
-/**
- * StreamRip Pro — Standalone Vanilla JavaScript Client
- * Communicates with the real Python 3 backend endpoints (/api/analyze, /api/jobs, /api/download)
- */
-
-let currentLang = 'en';
-
-document.getElementById('langToggle')?.addEventListener('click', () => {
-  currentLang = currentLang === 'en' ? 'hi' : 'en';
-  document.getElementById('heroTitle').textContent =
-    currentLang === 'en'
-      ? 'Authorized YouTube Media Processor & FFmpeg Workstation'
-      : 'अधिकृत YouTube मीडिया प्रोसेसर और FFmpeg वर्कस्टेशन';
-});
-
-document.getElementById('analyzeForm')?.addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const url = document.getElementById('urlInput').value.trim();
-  const errorBox = document.getElementById('errorBox');
-  const resultBox = document.getElementById('resultBox');
-  errorBox.classList.add('hidden');
-  resultBox.classList.add('hidden');
-
-  try {
-    const res = await fetch('/api/analyze', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url }),
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      errorBox.textContent = `${data.title_en || 'Error'}: ${data.message_en || ''}`;
-      errorBox.classList.remove('hidden');
-      return;
-    }
-    resultBox.innerHTML = `
-      <div style="margin-top:1.5rem">
-        <h3>${data.title}</h3>
-        <p>${data.channel} · ${data.duration_formatted} · ${data.video_id}</p>
-      </div>
-    `;
-    resultBox.classList.remove('hidden');
-  } catch (err) {
-    errorBox.textContent = String(err);
-    errorBox.classList.remove('hidden');
-  }
-});
+/* StreamRip Pro: frontend for backend /api/analyze, /api/jobs, /api/status/{id}, /api/download/{id}.
+   Endpoint response formats may vary; confirm against your backend before deploying. */
+'use strict';
+const $ = id => document.getElementById(id);
+let lang='hi', media=null, formats=[], polling=null, jobId=null, readyUrl=null;
+const tr={hi:{title:'वीडियो डाउनलोड वर्कस्पेस',sub:'अपने अधिकार वाले वीडियो का लिंक डालें, उपलब्ध क्वालिटी चुनें और प्रोसेसिंग देखें।',analyze:'वीडियो चेक करें',quality:'वीडियो क्वालिटी',download:'डाउनलोड शुरू करें',busy:'कृपया प्रतीक्षा करें…',bad:'सर्वर से मान्य जानकारी नहीं मिली।',failed:'डाउनलोड पूरा नहीं हो सका।'},en:{title:'Video Download Workspace',sub:'Paste a link to media you are allowed to process, choose an available quality and follow its progress.',analyze:'Analyze video',quality:'Video quality',download:'Start download',busy:'Please wait…',bad:'The server returned an invalid response.',failed:'Download could not be completed.'}};
+function show(id,on=true){$(id).classList.toggle('hidden',!on)}
+function error(msg){$('errorBox').textContent=String(msg);show('errorBox')}
+function clearError(){show('errorBox',false)}
+function busy(id,on){$(id).disabled=on;$(id).textContent=on?tr[lang].busy:(id==='analyzeBtn'?tr[lang].analyze:tr[lang].download)}
+function progress(n,stage){const pct=Math.max(0,Math.min(100,Number(n)||0));$('progressBar').style.width=pct+'%';$('progressPct').textContent=Math.round(pct)+'%';$('progressTrack').setAttribute('aria-valuenow',String(Math.round(pct)));if(stage)$('progressStage').textContent=stage;show('progressBox')}
+async function api(path,options){const res=await fetch(path,{cache:'no-store',...options});const raw=await res.text();let data;try{data=JSON.parse(raw)}catch{throw Error('Server response JSON नहीं है (HTTP '+res.status+').')}if(!res.ok)throw Error(data.message_en||data.message||data.error||data.title_en||'HTTP '+res.status);return data}
+function getFormats(data){const list=data.formats||data.qualities||data.available_formats||data.available_qualities||data.resolutions||[];if(!Array.isArray(list))return [];return list.map((x,i)=>{if(typeof x==='string'||typeof x==='number')return {id:String(x),label:String(x)};return {id:String(x.format_id??x.id??x.quality??x.resolution??i),label:String(x.label??x.quality_label??x.resolution??x.format_note??(x.height?x.height+'p':x.format_id??'Format '+(i+1)))}})}
+function allowedUrl(s){try{const u=new URL(s,location.origin);return u.origin===location.origin&&u.protocol.startsWith('http')?u.href:null}catch{return null}}
+function setComplete(url){const link=allowedUrl(url);if(!link){error('सर्वर ने डाउनलोड के लिए सुरक्षित लिंक नहीं दिया।');return}readyUrl=link;progress(100,'वीडियो तैयार है');$('saveLink').href=link;const player=$('videoPlayer');player.src=link;show('videoPlayer');show('completedBox');busy('downloadBtn',false);$('progressHint').textContent='सर्वर प्रोसेसिंग पूरी हुई। वीडियो सेव करने के लिए बटन दबाएँ।'}
+function stopPoll(){if(polling){clearInterval(polling);polling=null}}
+async function checkJob(){if(!jobId)return;try{let data;try{data=await api('/api/jobs/'+encodeURIComponent(jobId))}catch(e){if(!String(e.message).includes('HTTP 404'))throw e;data=await api('/api/status/'+encodeURIComponent(jobId))}const state=String(data.status??data.state??data.stage??'').toLowerCase();const pct=data.progress_percent??data.progress_pct??data.progress??data.percent??0;const numeric=typeof pct==='string'?parseFloat(pct):pct;progress(numeric,data.stage_message||data.message||data.status||'प्रोसेसिंग जारी है…');if(['failed','error','cancelled','canceled'].includes(state)){stopPoll();busy('downloadBtn',false);error(data.error||data.message||tr[lang].failed);return}if(['completed','complete','finished','done','success','ready'].includes(state)||data.download_ready===true){stopPoll();setComplete(data.download_url||data.file_url||'/api/download/'+encodeURIComponent(jobId))}}catch(e){stopPoll();busy('downloadBtn',false);error(e.message)}}
+$('langToggle').addEventListener('click',()=>{lang=lang==='hi'?'en':'hi';document.documentElement.lang=lang;$('langToggle').textContent=lang==='hi'?'English':'हिन्दी';$('heroTitle').textContent=tr[lang].title;$('heroSub').textContent=tr[lang].sub;$('qualityLabel').textContent=tr[lang].quality;if(!$('analyzeBtn').disabled)busy('analyzeBtn',false);if(!$('downloadBtn').disabled)busy('downloadBtn',false)});
+$('pasteBtn').addEventListener('click',async()=>{try{$('urlInput').value=await navigator.clipboard.readText()}catch{error('Paste की अनुमति नहीं मिली। लिंक को इनपुट में पेस्ट करें।')}});
+$('analyzeForm').addEventListener('submit',async e=>{e.preventDefault();stopPoll();jobId=null;readyUrl=null;clearError();show('resultBox',false);show('progressBox',false);show('completedBox',false);$('videoPlayer').removeAttribute('src');$('videoPlayer').load();const url=$('urlInput').value.trim();busy('analyzeBtn',true);try{const data=await api('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});media={...data,url};formats=getFormats(data);$('videoTitle').textContent=data.title||data.video_title||'वीडियो';$('videoMeta').textContent=[data.channel||data.uploader,data.duration_formatted||data.duration].filter(Boolean).join(' · ');const thumb=data.thumbnail||data.thumbnail_url;if(thumb&&/^https?:\/\//.test(thumb)){$('thumbnail').src=thumb;show('thumbnail')}else show('thumbnail',false);const sel=$('qualitySelect');sel.replaceChildren();if(!formats.length){const opt=new Option('सर्वर की डिफ़ॉल्ट क्वालिटी','best');sel.add(opt)}else for(const f of formats)sel.add(new Option(f.label,f.id));show('resultBox')}catch(e){error(e.message)}finally{busy('analyzeBtn',false)}});
+$('downloadBtn').addEventListener('click',async()=>{if(!media)return;clearError();stopPoll();show('completedBox',false);progress(0,'डाउनलोड जॉब शुरू हो रही है…');busy('downloadBtn',true);try{const quality=$('qualitySelect').value;const data=await api('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:media.url,format_id:quality,quality,video_id:media.video_id})});jobId=data.job_id??data.id??data.job?.id;if(data.download_url||data.file_url){setComplete(data.download_url||data.file_url);return}if(!jobId)throw Error('Backend ने job_id नहीं भेजा। /api/jobs का response जाँचें।');await checkJob();if(!readyUrl&&$('downloadBtn').disabled)polling=setInterval(checkJob,1800)}catch(e){busy('downloadBtn',false);error(e.message)}});
+$('newBtn').addEventListener('click',()=>{stopPoll();show('completedBox',false);show('progressBox',false);show('resultBox',false);$('urlInput').value='';$('urlInput').focus()});
+window.addEventListener('pagehide',stopPoll);
