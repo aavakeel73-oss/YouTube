@@ -611,7 +611,7 @@ export default function App() {
 
   async function fetchVerifiedMediaBlob(job: MediaJob): Promise<string | null> {
     setIsFetchingBlob(true);
-    setDownloadProgress(85);
+    setDownloadProgress(75);
     setDownloadSpeedMbps(90.0);
     const defaultMime = job.filename.endsWith('.mp4')
       ? 'video/mp4'
@@ -625,90 +625,167 @@ export default function App() {
     const startTime = performance.now();
 
     try {
-      // 1. Authenticated in-browser streaming request with credentials: 'include'
-      const res = await fetch(directDownloadUrl, {
-        method: 'GET',
-        credentials: 'include',
-        signal: controller.signal,
-      });
-
-      if (!res.ok) {
-        try {
-          const errPayload = await res.json();
-          if (errPayload && errPayload.error_code) {
-            setErrorDiag(errPayload as DiagnosticErrorPayload);
-            return null;
-          }
-        } catch {}
-        throw new Error(`Media stream verification returned HTTP ${res.status}`);
-      }
-
-      const contentType = (res.headers.get('content-type') || '').toLowerCase();
-      if (contentType.includes('text/html') || contentType.includes('application/json')) {
-        try {
-          const errPayload = await res.json();
-          if (errPayload && errPayload.error_code) {
-            setErrorDiag(errPayload as DiagnosticErrorPayload);
-            return null;
-          }
-        } catch {}
-        throw new Error('Received HTML or JSON interception instead of binary media stream');
-      }
-
-      const totalBytes =
-        Number(res.headers.get('content-length')) ||
-        Number(res.headers.get('x-streamrip-verified-bytes')) ||
+      let totalBytes =
         Number(job.file_size_bytes) ||
+        Number(job.actual_size_bytes) ||
+        Number(job.ffprobe_validation?.size_bytes) ||
         0;
 
-      // 2. Stream chunked binary bytes into memory
-      const reader = res.body?.getReader();
+      // Probe exact byte length via HEAD if not already known
+      if (totalBytes <= 0) {
+        const headRes = await fetch(directDownloadUrl, {
+          method: 'HEAD',
+          credentials: 'include',
+          signal: controller.signal,
+        });
+        if (headRes.ok) {
+          totalBytes =
+            Number(headRes.headers.get('x-streamrip-verified-bytes')) ||
+            Number(headRes.headers.get('content-length')) ||
+            0;
+        }
+      }
+
       const chunks: BlobPart[] = [];
       let receivedBytes = 0;
+      const CHUNK_SIZE = 8 * 1024 * 1024; // 8 MB per Range request (bypasses 25-32 MB cloud proxy cap)
 
-      if (reader) {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (value && value.length > 0) {
-            if (chunks.length === 0 && value.length >= 64) {
-              const sample = new TextDecoder().decode(value.slice(0, 64)).toLowerCase();
-              if (sample.includes('<!doctype') || sample.includes('<html') || sample.includes('cookie check')) {
-                throw new Error('Received authentication check page instead of media bytes');
+      if (totalBytes > 0) {
+        while (receivedBytes < totalBytes) {
+          const endByte = Math.min(receivedBytes + CHUNK_SIZE - 1, totalBytes - 1);
+          let chunkSuccess = false;
+          let lastChunkErr: unknown = null;
+
+          for (let retry = 0; retry < 5; retry++) {
+            try {
+              const rangeRes = await fetch(directDownloadUrl, {
+                method: 'GET',
+                credentials: 'include',
+                signal: controller.signal,
+                headers: {
+                  Range: `bytes=${receivedBytes}-${endByte}`,
+                },
+              });
+
+              if (!rangeRes.ok && rangeRes.status !== 206 && rangeRes.status !== 200) {
+                try {
+                  const errPayload = await rangeRes.json();
+                  if (errPayload && errPayload.error_code) {
+                    setErrorDiag(errPayload as DiagnosticErrorPayload);
+                    return null;
+                  }
+                } catch {}
+                throw new Error(`HTTP ${rangeRes.status} during chunk transfer`);
               }
-            }
-            chunks.push(value);
-            receivedBytes += value.length;
-            const elapsedSec = Math.max(0.05, (performance.now() - startTime) / 1000);
-            const measuredMbps = (receivedBytes / (1024 * 1024)) / elapsedSec;
-            setDownloadSpeedMbps(measuredMbps >= 1 ? Math.min(99.9, Number(measuredMbps.toFixed(1))) : 90.0);
-            if (totalBytes > 0) {
-              const pct = Math.min(99, Math.max(85, 85 + Math.floor((receivedBytes / totalBytes) * 14)));
+
+              const cType = (rangeRes.headers.get('content-type') || '').toLowerCase();
+              if (cType.includes('text/html') || cType.includes('application/json')) {
+                throw new Error('Received HTML/JSON instead of binary media chunk');
+              }
+
+              const buf = await rangeRes.arrayBuffer();
+              if (buf.byteLength === 0) {
+                throw new Error('Empty media chunk received from server');
+              }
+
+              if (receivedBytes === 0 && isHtmlInterceptionBuffer(buf)) {
+                throw new Error('Received HTML interception page instead of media binary');
+              }
+
+              // If server returned 200 full body instead of 206 range on small files, accept full body
+              if (rangeRes.status === 200 && receivedBytes === 0 && buf.byteLength >= totalBytes) {
+                chunks.push(new Uint8Array(buf));
+                receivedBytes = buf.byteLength;
+                chunkSuccess = true;
+                break;
+              }
+
+              chunks.push(new Uint8Array(buf));
+              receivedBytes += buf.byteLength;
+              chunkSuccess = true;
+
+              const elapsedSec = Math.max(0.05, (performance.now() - startTime) / 1000);
+              const measuredMbps = receivedBytes / (1024 * 1024) / elapsedSec;
+              setDownloadSpeedMbps(
+                measuredMbps >= 0.5 ? Math.min(99.9, Number(measuredMbps.toFixed(1))) : 90.0
+              );
+              const pct = Math.min(99, Math.max(75, 75 + Math.floor((receivedBytes / totalBytes) * 24)));
               setDownloadProgress(pct);
+              break;
+            } catch (chunkErr) {
+              if ((chunkErr as Error)?.name === 'AbortError') {
+                throw chunkErr;
+              }
+              lastChunkErr = chunkErr;
+              await new Promise((r) => window.setTimeout(r, 500 * (retry + 1)));
             }
+          }
+
+          if (!chunkSuccess) {
+            throw lastChunkErr || new Error('Failed to transfer complete media stream after retries');
           }
         }
       } else {
-        const fullBuf = await res.arrayBuffer();
-        chunks.push(new Uint8Array(fullBuf));
-        receivedBytes = fullBuf.byteLength;
+        // Fallback stream reader when totalBytes is unknown beforehand
+        const res = await fetch(directDownloadUrl, {
+          method: 'GET',
+          credentials: 'include',
+          signal: controller.signal,
+        });
+        if (!res.ok) {
+          throw new Error(`Media stream returned HTTP ${res.status}`);
+        }
+        const buf = await res.arrayBuffer();
+        if (buf.byteLength === 0 || isHtmlInterceptionBuffer(buf)) {
+          throw new Error('Invalid or empty media stream');
+        }
+        chunks.push(new Uint8Array(buf));
+        receivedBytes = buf.byteLength;
+        totalBytes = receivedBytes;
+      }
+
+      // Strict Completeness Verification: never save an incomplete/truncated file!
+      if (totalBytes > 0 && receivedBytes < totalBytes) {
+        const recMb = (receivedBytes / (1024 * 1024)).toFixed(2);
+        const totMb = (totalBytes / (1024 * 1024)).toFixed(2);
+        setErrorDiag({
+          http_status: 502,
+          error_code: 'INCOMPLETE_DOWNLOAD_ABORTED',
+          title_en: 'Incomplete Video Transfer Detected',
+          title_hi: 'अधूरा वीडियो डाउनलोड रोका गया',
+          message_en: `Only ${recMb} MB of ${totMb} MB was received. Incomplete file was rejected so corrupt media is not saved.`,
+          message_hi: `कुल ${totMb} MB में से केवल ${recMb} MB प्राप्त हुआ। अधूरी फ़ाइल को सेव होने से रोक दिया गया है। कृपया पुनः प्रयास करें।`,
+          action_en: 'Tap quality button to retry.',
+          action_hi: 'दोबारा डाउनलोड करने के लिए क्वालिटी बटन दबाएं।',
+        });
+        return null;
       }
 
       setDownloadProgress(100);
 
-      // 3. Assemble complete binary Blob & create local blob: URL (100% Android Chrome safe)
+      // Assemble complete binary Blob & create local blob: URL (100% Android Chrome safe)
       const finalBlob = new Blob(chunks, { type: defaultMime });
       const objectUrl = URL.createObjectURL(finalBlob);
 
-      // 4. Update state and prepare Web Share File
       setVerifiedBlobUrl(objectUrl);
-      const mediaFile = new File([finalBlob], job.filename, { type: defaultMime });
-      setVerifiedMediaFile(mediaFile);
+      setActiveJob((prev) =>
+        prev && prev.job_id === job.job_id
+          ? {
+              ...prev,
+              file_size_bytes: finalBlob.size,
+              actual_size_bytes: finalBlob.size,
+            }
+          : prev
+      );
 
-      // Clear any previous error banner since media is verified ready
+      // Only allocate duplicate File object for Web Share if <= 25 MB to preserve mobile RAM
+      if (finalBlob.size <= 25 * 1024 * 1024) {
+        setVerifiedMediaFile(new File([finalBlob], job.filename, { type: defaultMime }));
+      } else {
+        setVerifiedMediaFile(null);
+      }
+
       setErrorDiag(null);
-
-      // 5. Trigger instant in-browser download
       triggerBrowserDownload(objectUrl, job.filename);
 
       return objectUrl;
@@ -716,10 +793,17 @@ export default function App() {
       if ((err as Error)?.name === 'AbortError') {
         return null;
       }
-      console.warn('In-browser stream transfer fallback:', err);
-      setVerifiedBlobUrl(directDownloadUrl);
-      triggerBrowserDownload(directDownloadUrl, job.filename);
-      return directDownloadUrl;
+      setErrorDiag({
+        http_status: 502,
+        error_code: 'STREAM_TRANSFER_INTERRUPTED',
+        title_en: 'Download Stream Interrupted',
+        title_hi: 'डाउनलोड के दौरान नेटवर्क बाधित हुआ',
+        message_en: `Full video download could not be completed (${String(err)}). Please tap the quality button to retry.`,
+        message_hi: `पूरा वीडियो डाउनलोड नहीं हो सका (${String(err)})। अधूरी फ़ाइल सेव नहीं की गई है। कृपया दोबारा प्रयास करें।`,
+        action_en: 'Retry download.',
+        action_hi: 'दोबारा प्रयास करें।',
+      });
+      return null;
     } finally {
       setIsFetchingBlob(false);
     }
@@ -759,7 +843,7 @@ export default function App() {
     if (overrideAudioFmt) setSelectedAudioFormat(overrideAudioFmt);
     if (overrideAudioBr) setSelectedAudioBitrate(overrideAudioBr);
     setDownloadingQualityId(targetMode === 'video' ? targetQuality : targetAudioFmt);
-    setDownloadProgress(12);
+    setDownloadProgress(10);
     setDownloadSpeedMbps(90.0);
 
     if (verifiedBlobUrl) {
@@ -800,7 +884,7 @@ export default function App() {
       const job = data as MediaJob;
       setActiveJob(job);
       setIsStartingJob(false);
-      setDownloadProgress(Math.max(20, job.progress || 25));
+      setDownloadProgress(Math.max(15, Math.min(74, Math.floor((job.progress || 20) * 0.75))));
 
       if (job.status === 'completed') {
         await fetchVerifiedMediaBlob(job);
@@ -823,7 +907,7 @@ export default function App() {
           const updatedJob = (await pollRes.json()) as MediaJob;
           setActiveJob(updatedJob);
           if (typeof updatedJob.progress === 'number') {
-            setDownloadProgress(Math.min(84, Math.max(25, updatedJob.progress)));
+            setDownloadProgress(Math.min(74, Math.max(15, Math.floor(updatedJob.progress * 0.75))));
           }
 
           if (updatedJob.status === 'completed' || updatedJob.status === 'failed') {
@@ -1043,32 +1127,13 @@ export default function App() {
                 <div
                   className="h-full bg-gradient-to-r from-sky-400 to-cyan-400 rounded-full transition-all duration-300"
                   style={{
-                    width: `${Math.min(
-                      99,
-                      Math.max(
-                        5,
-                        isFetchingBlob
-                          ? downloadProgress || 95
-                          : activeJob?.progress || downloadProgress || 15
-                      )
-                    )}%`,
+                    width: `${Math.min(99, Math.max(5, downloadProgress || 12))}%`,
                   }}
                 />
               </div>
 
               <div className="flex items-center justify-between text-xs sm:text-sm font-mono tabular-nums text-slate-300">
-                <span>
-                  {Math.min(
-                    99,
-                    Math.max(
-                      5,
-                      isFetchingBlob
-                        ? downloadProgress || 95
-                        : activeJob?.progress || downloadProgress || 15
-                    )
-                  )}
-                  %
-                </span>
+                <span>{Math.min(99, Math.max(5, downloadProgress || 12))}%</span>
                 <span>{downloadSpeedMbps.toFixed(1)} MB/s</span>
               </div>
             </div>
@@ -1249,8 +1314,9 @@ export default function App() {
 
                   {/* 2-Column Quality Selection Cards (Tap to Immediately Download with Modal Progress) */}
                   <div className="grid grid-cols-2 gap-3 pt-1">
-                    {displayedQualities
-                      .filter((q) => q.available)
+                    {[...displayedQualities]
+                      .filter((q) => q.available && q.height <= 1080)
+                      .sort((a, b) => b.height - a.height)
                       .map((q) => {
                         const shortLabel = q.label.split(' ')[0] || q.id;
                         const sizeLabel = q.estimated_size_mb
