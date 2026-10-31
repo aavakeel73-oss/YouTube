@@ -199,6 +199,7 @@ async function startServer() {
   app.use('/api', (req: Request, res: Response) => {
     req.setTimeout(0);
     res.setTimeout(0);
+    req.socket?.setNoDelay(true);
 
     const options: http.RequestOptions = {
       hostname: PYTHON_HOST,
@@ -209,22 +210,50 @@ async function startServer() {
       headers: {
         ...req.headers,
         host: `${PYTHON_HOST}:${PYTHON_TARGET_PORT}`,
+        connection: 'close',
       },
     };
 
     const proxyReq = http.request(options, (proxyRes) => {
       res.status(proxyRes.statusCode || 500);
       Object.entries(proxyRes.headers).forEach(([key, val]) => {
-        if (val !== undefined && !HOP_BY_HOP_HEADERS.has(key.toLowerCase())) {
+        const lowKey = key.toLowerCase();
+        if (
+          val !== undefined &&
+          !HOP_BY_HOP_HEADERS.has(lowKey) &&
+          !lowKey.startsWith('access-control-')
+        ) {
           res.setHeader(key, val);
         }
       });
-      res.setHeader('Cache-Control', 'private, no-store');
+      res.setHeader('Cache-Control', 'private, no-store, no-transform');
       res.setHeader('X-Content-Type-Options', 'nosniff');
+
+      proxyRes.on('error', () => {
+        if (!res.writableEnded) {
+          res.destroy();
+        }
+      });
+
+      if (req.method === 'HEAD') {
+        proxyRes.resume();
+        res.end();
+        return;
+      }
+
       proxyRes.pipe(res);
     });
 
+    proxyReq.on('socket', (sock) => {
+      sock.setNoDelay(true);
+    });
     proxyReq.setTimeout(0);
+
+    res.on('close', () => {
+      if (!res.writableEnded) {
+        proxyReq.destroy();
+      }
+    });
 
     proxyReq.on('error', (err) => {
       if (!res.headersSent) {
@@ -236,7 +265,13 @@ async function startServer() {
           message_en: `Backend gateway could not reach Python media engine: ${err.message}`,
           message_hi: 'बैकएंड गेटवे Python मीडिया इंजन तक नहीं पहुंच सका।',
         });
+      } else if (!res.writableEnded) {
+        res.destroy();
       }
+    });
+
+    req.on('error', () => {
+      proxyReq.destroy();
     });
 
     req.pipe(proxyReq);
