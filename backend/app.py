@@ -249,16 +249,19 @@ def run_qa_verification_suite() -> Dict[str, Any]:
 
 class StreamRipRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    disable_nagle_algorithm = True
 
     def log_message(self, format: str, *args: Any) -> None:
         # Keep stdout clean and structured
         pass
 
     def _send_json(self, status_code: int, payload: Dict[str, Any], extra_headers: Optional[Dict[str, str]] = None) -> None:
+        self.close_connection = True
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD")
@@ -271,7 +274,9 @@ class StreamRipRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_OPTIONS(self) -> None:
+        self.close_connection = True
         self.send_response(204)
+        self.send_header("Connection", "close")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD")
         self.send_header("Access-Control-Allow-Headers", "Range, Content-Type, Authorization, X-StreamRip-Session, Cache-Control, Pragma, Accept, *")
@@ -389,24 +394,28 @@ class StreamRipRequestHandler(BaseHTTPRequestHandler):
 
             file_size = os.path.getsize(file_path)
             disposition = "inline" if inline_mode else "attachment"
+            safe_disp_name = filename.encode("ascii", "ignore").decode("ascii").replace('"', "") or f"StreamRip_{job_id}.mp4"
 
             # Support HTTP Range requests for mobile Chrome / HTML5 media playback
             range_header = self.headers.get("Range")
             if range_header and range_header.startswith("bytes="):
                 try:
-                    range_spec = range_header.split("=", 1)[1]
+                    range_spec = range_header.split("=", 1)[1].split(",")[0].strip()
                     start_str, end_str = range_spec.split("-", 1)
                     start_byte = int(start_str) if start_str else 0
                     end_byte = int(end_str) if end_str else file_size - 1
-                    end_byte = min(end_byte, file_size - 1)
+                    start_byte = max(0, min(start_byte, file_size - 1))
+                    end_byte = max(start_byte, min(end_byte, file_size - 1))
                     chunk_len = (end_byte - start_byte) + 1
 
+                    self.close_connection = True
                     self.send_response(206)
                     self.send_header("Content-Type", mime_type)
                     self.send_header("Content-Length", str(chunk_len))
                     self.send_header("Content-Range", f"bytes {start_byte}-{end_byte}/{file_size}")
                     self.send_header("Accept-Ranges", "bytes")
-                    self.send_header("Content-Disposition", f'{disposition}; filename="{filename}"')
+                    self.send_header("Connection", "close")
+                    self.send_header("Content-Disposition", f'{disposition}; filename="{safe_disp_name}"')
                     self.send_header("Access-Control-Allow-Origin", "*")
                     self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD")
                     self.send_header("Access-Control-Allow-Headers", "Range, Content-Type, Authorization, X-StreamRip-Session, *")
@@ -415,26 +424,29 @@ class StreamRipRequestHandler(BaseHTTPRequestHandler):
                     self.send_header("X-StreamRip-Verified-Bytes", str(file_size))
                     self.end_headers()
 
-                    with open(file_path, "rb") as f:
+                    with open(file_path, "rb", buffering=1048576) as f:
                         f.seek(start_byte)
                         remaining = chunk_len
                         while remaining > 0:
-                            data = f.read(min(1048576, remaining))
+                            data = f.read(min(524288, remaining))
                             if not data:
                                 break
                             self.wfile.write(data)
                             remaining -= len(data)
+                    self.wfile.flush()
                     return
                 except (BrokenPipeError, ConnectionResetError):
                     return
-                except Exception as exc:
+                except Exception:
                     return
 
+            self.close_connection = True
             self.send_response(200)
             self.send_header("Content-Type", mime_type)
             self.send_header("Content-Length", str(file_size))
             self.send_header("Accept-Ranges", "bytes")
-            self.send_header("Content-Disposition", f'{disposition}; filename="{filename}"')
+            self.send_header("Connection", "close")
+            self.send_header("Content-Disposition", f'{disposition}; filename="{safe_disp_name}"')
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD")
             self.send_header("Access-Control-Allow-Headers", "Range, Content-Type, Authorization, X-StreamRip-Session, *")
@@ -444,12 +456,13 @@ class StreamRipRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
             try:
-                with open(file_path, "rb") as f:
+                with open(file_path, "rb", buffering=1048576) as f:
                     while True:
-                        chunk = f.read(1048576)
+                        chunk = f.read(524288)
                         if not chunk:
                             break
                         self.wfile.write(chunk)
+                self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
             return
@@ -457,6 +470,7 @@ class StreamRipRequestHandler(BaseHTTPRequestHandler):
         self._send_json(404, build_diagnostic_response(404, "ENDPOINT_NOT_FOUND"))
 
     def do_HEAD(self) -> None:
+        self.close_connection = True
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         if path.startswith("/api/download/") or path.startswith("/api/file/"):
@@ -465,14 +479,17 @@ class StreamRipRequestHandler(BaseHTTPRequestHandler):
             job = engine.get_job(job_id)
             if not job or job.get("status") != "completed":
                 self.send_response(404)
+                self.send_header("Connection", "close")
                 self.end_headers()
                 return
             file_path = job.get("output_path")
             if not file_path or not os.path.exists(file_path):
                 self.send_response(404)
+                self.send_header("Connection", "close")
                 self.end_headers()
                 return
             filename = job.get("filename") or os.path.basename(file_path)
+            safe_disp_name = filename.encode("ascii", "ignore").decode("ascii").replace('"', "") or f"StreamRip_{job_id}.mp4"
             mime_type, _ = mimetypes.guess_type(filename)
             if not mime_type:
                 mime_type = "video/mp4" if filename.endswith(".mp4") else "audio/mpeg"
@@ -481,12 +498,16 @@ class StreamRipRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", mime_type)
             self.send_header("Content-Length", str(file_size))
             self.send_header("Accept-Ranges", "bytes")
-            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Connection", "close")
+            self.send_header("Content-Disposition", f'attachment; filename="{safe_disp_name}"')
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Expose-Headers", "Content-Length, Content-Range, Content-Disposition, Accept-Ranges, X-StreamRip-Job-Id, X-StreamRip-Verified-Bytes")
             self.send_header("X-StreamRip-Job-Id", job_id)
             self.send_header("X-StreamRip-Verified-Bytes", str(file_size))
             self.end_headers()
             return
         self.send_response(200)
+        self.send_header("Connection", "close")
         self.end_headers()
 
     def do_POST(self) -> None:
@@ -709,6 +730,8 @@ class StreamRipRequestHandler(BaseHTTPRequestHandler):
 
 def run_server(host: str = "127.0.0.1", port: int = 5001) -> None:
     ThreadingHTTPServer.allow_reuse_address = True
+    ThreadingHTTPServer.daemon_threads = True
+    ThreadingHTTPServer.request_queue_size = 128
     server = ThreadingHTTPServer((host, port), StreamRipRequestHandler)
     print(f"[StreamRip Pro Python Engine] Listening on http://{host}:{port}", flush=True)
     server.serve_forever()

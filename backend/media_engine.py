@@ -135,7 +135,10 @@ class MediaEngine:
         self.analysis_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         self.upstream_streams: Dict[str, Dict[str, Any]] = {}
         self.prefetch_events: Dict[str, threading.Event] = {}
+        self.inflight_notube: Dict[str, Dict[str, Any]] = {}
+        self.sanitized_files: set = set()
         self._active_upstream_server: int = 80
+        self._upstream_server_checked_at: float = 0.0
         self._ssl_ctx = ssl._create_unverified_context()
         self.metrics: Dict[str, Any] = {
             "started_at": int(time.time()),
@@ -302,6 +305,9 @@ class MediaEngine:
             return None, None
 
     def _get_upstream_server(self) -> int:
+        now = time.time()
+        if (now - self._upstream_server_checked_at) < 300.0:
+            return self._active_upstream_server
         candidates = [self._active_upstream_server, 80, 61]
         seen = set()
         ua = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36"
@@ -317,9 +323,11 @@ class MediaEngine:
                 with urllib.request.urlopen(req, context=self._ssl_ctx, timeout=1.5) as r:
                     if r.status == 200:
                         self._active_upstream_server = s
+                        self._upstream_server_checked_at = now
                         return s
             except Exception:
                 continue
+        self._upstream_server_checked_at = now
         return 80
 
     def _start_background_prefetch(self, video_id: str, stream_url: str, expected_len: int = 0) -> None:
@@ -1006,14 +1014,111 @@ class MediaEngine:
         with self.lock:
             self.analysis_cache[video_id] = (time.time(), result_payload)
 
-        # Prefetch scene frames in background for fast fallback if needed
+        # Prefetch scene frames and pre-warm upstream video/audio streams in background for instant downloads
         threading.Thread(
             target=self._download_youtube_scene_frames,
             args=(video_id, f"prefetch_{video_id}"),
             daemon=True,
         ).start()
+        if not ref_entry:
+            threading.Thread(
+                target=self._prewarm_upstream_streams,
+                args=(video_id, canonical_url, avail_heights),
+                daemon=True,
+            ).start()
 
         return 200, result_payload
+
+    def _prewarm_upstream_streams(self, video_id: str, canonical_url: str, avail_heights: List[int]) -> None:
+        """
+        Immediately pre-warms HD (1080p/720p) on Notube and MP3 on Clipto in parallel
+        as soon as URL analysis completes so user downloads finish with minimal wait time.
+        """
+        try:
+            cached_hd_mp4 = os.path.join(TEMP_STORAGE_DIR, f"cached_full_{video_id}_hd1080.mp4")
+            cached_mp3 = os.path.join(TEMP_STORAGE_DIR, f"cached_audio_{video_id}_mp3.mp3")
+
+            if any(h >= 720 for h in avail_heights) and not (os.path.exists(cached_hd_mp4) and os.path.getsize(cached_hd_mp4) > 50000):
+                threading.Thread(
+                    target=self._download_from_notube,
+                    kwargs={
+                        "job_id": "",
+                        "video_id": video_id,
+                        "canonical_url": canonical_url,
+                        "fmt": "mp4hd",
+                        "dest_path": cached_hd_mp4,
+                        "preferred_server": 80,
+                    },
+                    daemon=True,
+                ).start()
+
+            if not (os.path.exists(cached_mp3) and os.path.getsize(cached_mp3) > 20000):
+                threading.Thread(
+                    target=self._prewarm_clipto_mp3,
+                    args=(video_id, canonical_url, cached_mp3),
+                    daemon=True,
+                ).start()
+        except Exception:
+            pass
+
+    def _prewarm_clipto_mp3(self, video_id: str, canonical_url: str, dest_mp3_path: str) -> bool:
+        if os.path.exists(dest_mp3_path) and os.path.getsize(dest_mp3_path) > 20000:
+            return True
+        ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        part_mp3 = f"{dest_mp3_path}.{uuid.uuid4().hex[:6]}.part"
+        try:
+            cj = http.cookiejar.CookieJar()
+            opener = urllib.request.build_opener(
+                urllib.request.HTTPSHandler(context=self._ssl_ctx),
+                urllib.request.HTTPCookieProcessor(cj),
+            )
+            req_csrf = urllib.request.Request(
+                "https://www.clipto.com/api/csrf",
+                headers={
+                    "User-Agent": ua,
+                    "Referer": "https://www.clipto.com/media-downloader/youtube-downloader",
+                },
+            )
+            csrf_data = json.loads(opener.open(req_csrf, timeout=8).read().decode("utf-8", errors="ignore"))
+            csrf_token = csrf_data.get("csrfToken")
+            if not csrf_token:
+                return False
+            mp3_url = (
+                f"https://www.clipto.com/api/youtube/mp3?"
+                f"url={urllib.parse.quote(canonical_url)}&csrfToken={urllib.parse.quote(csrf_token)}"
+            )
+            req_mp3 = urllib.request.Request(
+                mp3_url,
+                headers={
+                    "User-Agent": ua,
+                    "Referer": "https://www.clipto.com/media-downloader/youtube-downloader",
+                },
+            )
+            with opener.open(req_mp3, timeout=90) as r_mp3:
+                first_chunk = True
+                with open(part_mp3, "wb") as out_f:
+                    while True:
+                        chunk = r_mp3.read(1048576)
+                        if not chunk:
+                            break
+                        if first_chunk:
+                            first_chunk = False
+                            head_s = chunk[:64].decode("utf-8", errors="ignore").strip().lower()
+                            if head_s.startswith("<!doctype") or head_s.startswith("<html"):
+                                raise RuntimeError("HTML response")
+                        out_f.write(chunk)
+            if os.path.exists(part_mp3) and os.path.getsize(part_mp3) > 20000:
+                os.replace(part_mp3, dest_mp3_path)
+                return True
+        except Exception:
+            pass
+        finally:
+            if os.path.exists(part_mp3):
+                try:
+                    os.remove(part_mp3)
+                except OSError:
+                    pass
+        return False
 
     def _handle_simulated_diagnostic(self, diag_type: str) -> Tuple[int, Dict[str, Any]]:
         diag_upper = diag_type.upper()
@@ -1192,178 +1297,247 @@ class MediaEngine:
         canonical_url: str,
         fmt: str,
         dest_path: str,
+        preferred_server: Optional[int] = None,
     ) -> Tuple[bool, Optional[str]]:
         """
-        Executes the 4-step Notube upstream extraction & muxing pipeline:
-        1. recover_weight.php (discover token, filename, and target stream weight)
-        2. recover_file.php (pull full-length video+audio streams on upstream server)
-        3. conversion.php (lossless muxing into MP4/MP3/M4A container)
-        4. Parse signed download.php?token=...&key=... URL and stream verified binary with Range resume.
+        Executes the 4-step Notube upstream extraction & muxing pipeline with:
+        - Instant cache hit return
+        - In-flight deduplication across background pre-warmer and user clicks
+        - High-throughput 1 MB streaming buffer and Range resume
         """
+        if os.path.exists(dest_path) and os.path.getsize(dest_path) > 50000:
+            return True, None
+
+        inflight_key = f"{video_id}:{fmt}"
+        with self.lock:
+            existing = self.inflight_notube.get(inflight_key)
+            if existing and not existing["event"].is_set():
+                if job_id:
+                    existing["waiters"].add(job_id)
+                    if existing.get("last_state"):
+                        self.jobs.get(job_id, {}).update(existing["last_state"])
+                wait_ev = existing["event"]
+            else:
+                wait_ev = None
+                entry: Dict[str, Any] = {
+                    "event": threading.Event(),
+                    "waiters": {job_id} if job_id else set(),
+                    "last_state": {},
+                    "ok": False,
+                    "dl_url": None,
+                }
+                self.inflight_notube[inflight_key] = entry
+
+        if wait_ev is not None:
+            wait_ev.wait(timeout=150)
+            if os.path.exists(dest_path) and os.path.getsize(dest_path) > 50000:
+                with self.lock:
+                    info = self.inflight_notube.get(inflight_key) or {}
+                return True, info.get("dl_url")
+
+        def _broadcast_progress(**kwargs: Any) -> None:
+            with self.lock:
+                cur_entry = self.inflight_notube.get(inflight_key)
+                if not cur_entry:
+                    if job_id and job_id in self.jobs:
+                        self.jobs[job_id].update(kwargs)
+                    return
+                cur_entry["last_state"].update(kwargs)
+                for w_jid in list(cur_entry["waiters"]):
+                    if w_jid and w_jid in self.jobs:
+                        self.jobs[w_jid].update(kwargs)
+
         ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        servers = [self._get_upstream_server(), 80, 61]
+        first_srv = preferred_server if preferred_server in (80, 61) else self._get_upstream_server()
+        servers = [first_srv, 80, 61]
         seen_s = set()
 
-        for srv in servers:
-            if srv in seen_s:
-                continue
-            seen_s.add(srv)
-            part_path = f"{dest_path}.{uuid.uuid4().hex[:6]}.part"
-            try:
-                self._update_job(
-                    job_id,
-                    stage="PREPARING_UPSTREAM_STREAM",
-                    stage_label_en=f"Requesting full-length {fmt.upper()} stream from upstream relay (s{srv})...",
-                    stage_label_hi=f"अपस्ट्रीम रिले (s{srv}) से पूरा {fmt.upper()} वीडियो/ऑडियो तैयार किया जा रहा है...",
-                    progress=22,
-                )
-                d1 = urllib.parse.urlencode(
-                    {"url": canonical_url, "format": fmt, "lang": "en", "subscribed": "false"}
-                ).encode("utf-8")
-                req1 = urllib.request.Request(
-                    f"https://s{srv}.notube.net/recover_weight.php",
-                    data=d1,
-                    headers={"User-Agent": ua, "Origin": "https://notube.net", "Referer": "https://notube.net/"},
-                )
-                with urllib.request.urlopen(req1, context=self._ssl_ctx, timeout=15) as r1:
-                    res1 = json.loads(r1.read().decode("utf-8", errors="ignore"))
-
-                token = str(res1.get("token") or "").strip()
-                if not token:
+        try:
+            for srv in servers:
+                if srv in seen_s:
                     continue
-                name_mp4 = str(res1.get("name_mp4") or f"{video_id}.mp4")
+                seen_s.add(srv)
+                part_path = f"{dest_path}.{uuid.uuid4().hex[:6]}.part"
+                try:
+                    _broadcast_progress(
+                        stage="PREPARING_UPSTREAM_STREAM",
+                        stage_label_en=f"Requesting full-length {fmt.upper()} stream from upstream relay (s{srv})...",
+                        stage_label_hi=f"अपस्ट्रीम रिले (s{srv}) से पूरा {fmt.upper()} वीडियो/ऑडियो तैयार किया जा रहा है...",
+                        progress=22,
+                    )
+                    d1 = urllib.parse.urlencode(
+                        {"url": canonical_url, "format": fmt, "lang": "en", "subscribed": "false"}
+                    ).encode("utf-8")
+                    req1 = urllib.request.Request(
+                        f"https://s{srv}.notube.net/recover_weight.php",
+                        data=d1,
+                        headers={"User-Agent": ua, "Origin": "https://notube.net", "Referer": "https://notube.net/"},
+                    )
+                    with urllib.request.urlopen(req1, context=self._ssl_ctx, timeout=15) as r1:
+                        res1 = json.loads(r1.read().decode("utf-8", errors="ignore"))
 
-                self._update_job(
-                    job_id,
-                    stage="FETCHING_UPSTREAM_MEDIA",
-                    stage_label_en="Extracting full-length source video & audio streams (no truncation)...",
-                    stage_label_hi="पूरे वीडियो और ऑडियो स्ट्रीम निकाले जा रहे हैं (बिना किसी कटौती के)...",
-                    progress=34,
-                )
-                d2 = urllib.parse.urlencode(
-                    {
-                        "url": canonical_url,
-                        "format": fmt,
-                        "name_mp4": name_mp4,
-                        "lang": "en",
-                        "token": token,
-                        "subscribed": "false",
-                        "playlist": "false",
-                        "adblock": "false",
-                    }
-                ).encode("utf-8")
-                req2 = urllib.request.Request(
-                    f"https://s{srv}.notube.net/recover_file.php",
-                    data=d2,
-                    headers={"User-Agent": ua, "Origin": "https://notube.net", "Referer": "https://notube.net/"},
-                )
-                with urllib.request.urlopen(req2, context=self._ssl_ctx, timeout=120) as r2:
-                    raw2 = r2.read().decode("utf-8", errors="ignore")
+                    token = str(res1.get("token") or "").strip()
+                    if not token:
+                        continue
+                    name_mp4 = str(res1.get("name_mp4") or f"{video_id}.mp4")
+
+                    _broadcast_progress(
+                        stage="FETCHING_UPSTREAM_MEDIA",
+                        stage_label_en="Extracting full-length source video & audio streams (no truncation)...",
+                        stage_label_hi="पूरे वीडियो और ऑडियो स्ट्रीम निकाले जा रहे हैं (बिना किसी कटौती के)...",
+                        progress=36,
+                    )
+                    d2 = urllib.parse.urlencode(
+                        {
+                            "url": canonical_url,
+                            "format": fmt,
+                            "name_mp4": name_mp4,
+                            "lang": "en",
+                            "token": token,
+                            "subscribed": "false",
+                            "playlist": "false",
+                            "adblock": "false",
+                        }
+                    ).encode("utf-8")
+                    req2 = urllib.request.Request(
+                        f"https://s{srv}.notube.net/recover_file.php",
+                        data=d2,
+                        headers={"User-Agent": ua, "Origin": "https://notube.net", "Referer": "https://notube.net/"},
+                    )
+                    with urllib.request.urlopen(req2, context=self._ssl_ctx, timeout=120) as r2:
+                        raw2 = r2.read().decode("utf-8", errors="ignore")
+                        try:
+                            j2 = json.loads(raw2)
+                            if j2.get("token"):
+                                token = str(j2["token"]).strip()
+                        except Exception:
+                            pass
+
+                    _broadcast_progress(
+                        stage="REMUXING_UPSTREAM_CONTAINER",
+                        stage_label_en="Remuxing video & audio streams into final container...",
+                        stage_label_hi="वीडियो और ऑडियो स्ट्रीम को मर्ज किया जा रहा है...",
+                        progress=48,
+                    )
+                    d3 = urllib.parse.urlencode({"token": token}).encode("utf-8")
+                    req3 = urllib.request.Request(
+                        f"https://s{srv}.notube.net/conversion.php",
+                        data=d3,
+                        headers={"User-Agent": ua, "Origin": "https://notube.net", "Referer": "https://notube.net/"},
+                    )
+                    with urllib.request.urlopen(req3, context=self._ssl_ctx, timeout=120) as r3:
+                        r3.read()
+
+                    # Discover signed download.php?token=...&key=... URL
+                    dl_url = f"https://s{srv}.notube.net/download.php?token={token}"
                     try:
-                        j2 = json.loads(raw2)
-                        if j2.get("token"):
-                            token = str(j2["token"]).strip()
+                        req4 = urllib.request.Request(
+                            f"https://notube.net/en/download?token={urllib.parse.quote(token)}",
+                            headers={"User-Agent": ua, "Referer": "https://notube.net/"},
+                        )
+                        with urllib.request.urlopen(req4, context=self._ssl_ctx, timeout=12) as r4:
+                            html4 = r4.read().decode("utf-8", errors="ignore")
+                            found_links = re.findall(r"https://s[0-9]+\.notube\.net/download\.php\?[^\"'\s>]+", html4)
+                            if found_links:
+                                dl_url = found_links[0]
                     except Exception:
                         pass
 
-                self._update_job(
-                    job_id,
-                    stage="REMUXING_UPSTREAM_CONTAINER",
-                    stage_label_en="Remuxing video & audio streams into final container...",
-                    stage_label_hi="वीडियो और ऑडियो स्ट्रीम को मर्ज किया जा रहा है...",
-                    progress=46,
-                )
-                d3 = urllib.parse.urlencode({"token": token}).encode("utf-8")
-                req3 = urllib.request.Request(
-                    f"https://s{srv}.notube.net/conversion.php",
-                    data=d3,
-                    headers={"User-Agent": ua, "Origin": "https://notube.net", "Referer": "https://notube.net/"},
-                )
-                with urllib.request.urlopen(req3, context=self._ssl_ctx, timeout=120) as r3:
-                    r3.read()
-
-                # Discover signed download.php?token=...&key=... URL
-                dl_url = f"https://s{srv}.notube.net/download.php?token={token}"
-                try:
-                    req4 = urllib.request.Request(
-                        f"https://notube.net/en/download?token={urllib.parse.quote(token)}",
+                    # Stream binary file with 1 MB high-speed chunks and throttled progress updates
+                    req5 = urllib.request.Request(
+                        dl_url,
                         headers={"User-Agent": ua, "Referer": "https://notube.net/"},
                     )
-                    with urllib.request.urlopen(req4, context=self._ssl_ctx, timeout=15) as r4:
-                        html4 = r4.read().decode("utf-8", errors="ignore")
-                        found_links = re.findall(r"https://s[0-9]+\.notube\.net/download\.php\?[^\"'\s>]+", html4)
-                        if found_links:
-                            dl_url = found_links[0]
+                    last_update_t = 0.0
+                    with urllib.request.urlopen(req5, context=self._ssl_ctx, timeout=120) as r5:
+                        clen = int(r5.headers.get("Content-Length") or 0)
+                        downloaded = 0
+                        first_chunk = True
+                        with open(part_path, "wb", buffering=2 * 1024 * 1024) as out_f:
+                            while True:
+                                chunk = r5.read(1048576)
+                                if not chunk:
+                                    break
+                                if first_chunk:
+                                    first_chunk = False
+                                    head_s = chunk[:64].decode("utf-8", errors="ignore").strip().lower()
+                                    if head_s.startswith("<!doctype") or head_s.startswith("<html"):
+                                        raise RuntimeError("Upstream returned HTML instead of media binary")
+                                out_f.write(chunk)
+                                downloaded += len(chunk)
+                                now_t = time.time()
+                                if clen > 0 and (now_t - last_update_t >= 0.2 or downloaded >= clen):
+                                    last_update_t = now_t
+                                    pct = min(90, max(50, 50 + int((downloaded / clen) * 40)))
+                                    mb_done = downloaded / (1024 * 1024)
+                                    mb_tot = clen / (1024 * 1024)
+                                    _broadcast_progress(
+                                        progress=pct,
+                                        stage_label_en=f"Downloading full media ({mb_done:.1f} MB / {mb_tot:.1f} MB)...",
+                                        stage_label_hi=f"पूरा वीडियो डाउनलोड हो रहा है ({mb_done:.1f} MB / {mb_tot:.1f} MB)...",
+                                    )
+
+                    # Range resume retry if stream disconnected early
+                    for _retry in range(3):
+                        if clen <= 0 or downloaded >= clen:
+                            break
+                        try:
+                            time.sleep(0.5)
+                            resume_req = urllib.request.Request(
+                                dl_url,
+                                headers={"User-Agent": ua, "Referer": "https://notube.net/", "Range": f"bytes={downloaded}-"},
+                            )
+                            with urllib.request.urlopen(resume_req, context=self._ssl_ctx, timeout=90) as r_res:
+                                with open(part_path, "ab", buffering=2 * 1024 * 1024) as out_f:
+                                    while True:
+                                        chunk = r_res.read(1048576)
+                                        if not chunk:
+                                            break
+                                        out_f.write(chunk)
+                                        downloaded += len(chunk)
+                        except Exception:
+                            pass
+
+                    if os.path.exists(part_path):
+                        actual_sz = os.path.getsize(part_path)
+                        if (clen > 0 and actual_sz >= clen) or (clen <= 0 and actual_sz > 50000):
+                            if dest_path.endswith(".mp4"):
+                                self._sanitize_mp4_container(part_path, dest_path)
+                            else:
+                                os.replace(part_path, dest_path)
+                            with self.lock:
+                                cur_entry = self.inflight_notube.get(inflight_key)
+                                if cur_entry:
+                                    cur_entry["ok"] = True
+                                    cur_entry["dl_url"] = dl_url
+                            return True, dl_url
                 except Exception:
                     pass
+                finally:
+                    if os.path.exists(part_path):
+                        try:
+                            os.remove(part_path)
+                        except OSError:
+                            pass
+            return False, None
+        finally:
+            with self.lock:
+                fin_entry = self.inflight_notube.get(inflight_key)
+                if fin_entry:
+                    fin_entry["event"].set()
 
-                # Stream binary file with real-time byte progress and Range resume support
-                req5 = urllib.request.Request(
-                    dl_url,
-                    headers={"User-Agent": ua, "Referer": "https://notube.net/"},
-                )
-                with urllib.request.urlopen(req5, context=self._ssl_ctx, timeout=120) as r5:
-                    clen = int(r5.headers.get("Content-Length") or 0)
-                    downloaded = 0
-                    first_chunk = True
-                    with open(part_path, "wb") as out_f:
-                        while True:
-                            chunk = r5.read(262144)
-                            if not chunk:
-                                break
-                            if first_chunk:
-                                first_chunk = False
-                                head_s = chunk[:64].decode("utf-8", errors="ignore").strip().lower()
-                                if head_s.startswith("<!doctype") or head_s.startswith("<html"):
-                                    raise RuntimeError("Upstream returned HTML instead of media binary")
-                            out_f.write(chunk)
-                            downloaded += len(chunk)
-                            if clen > 0:
-                                pct = min(90, max(48, 48 + int((downloaded / clen) * 42)))
-                                mb_done = downloaded / (1024 * 1024)
-                                mb_tot = clen / (1024 * 1024)
-                                self._update_job(
-                                    job_id,
-                                    progress=pct,
-                                    stage_label_en=f"Downloading full media ({mb_done:.1f} MB / {mb_tot:.1f} MB)...",
-                                    stage_label_hi=f"पूरा वीडियो डाउनलोड हो रहा है ({mb_done:.1f} MB / {mb_tot:.1f} MB)...",
-                                )
-
-                # Range resume retry if stream disconnected early
-                for _retry in range(3):
-                    if clen <= 0 or downloaded >= clen:
-                        break
-                    try:
-                        time.sleep(1.0)
-                        resume_req = urllib.request.Request(
-                            dl_url,
-                            headers={"User-Agent": ua, "Referer": "https://notube.net/", "Range": f"bytes={downloaded}-"},
-                        )
-                        with urllib.request.urlopen(resume_req, context=self._ssl_ctx, timeout=90) as r_res:
-                            with open(part_path, "ab") as out_f:
-                                while True:
-                                    chunk = r_res.read(262144)
-                                    if not chunk:
-                                        break
-                                    out_f.write(chunk)
-                                    downloaded += len(chunk)
-                    except Exception:
-                        pass
-
-                if os.path.exists(part_path):
-                    actual_sz = os.path.getsize(part_path)
-                    if (clen > 0 and actual_sz >= clen) or (clen <= 0 and actual_sz > 50000):
-                        os.replace(part_path, dest_path)
-                        return True, dl_url
-            except Exception:
+    def _fast_link_or_copy(self, src_path: str, dst_path: str) -> None:
+        if src_path == dst_path:
+            return
+        if os.path.exists(dst_path):
+            try:
+                os.remove(dst_path)
+            except OSError:
                 pass
-            finally:
-                if os.path.exists(part_path):
-                    try:
-                        os.remove(part_path)
-                    except OSError:
-                        pass
-        return False, None
+        try:
+            os.link(src_path, dst_path)
+        except OSError:
+            shutil.copyfile(src_path, dst_path)
 
     def _download_real_upstream_media(
         self,
@@ -1381,97 +1555,49 @@ class MediaEngine:
     ) -> Tuple[bool, Optional[str]]:
         """
         Downloads the actual full-length YouTube video/audio file from the upstream media relays:
-        - Audio: Clipto CSRF relay or Notube MP3/M4A 4-step pipeline
+        - Audio: Cached or live Clipto CSRF relay or Notube MP3/M4A 4-step pipeline
         - Video (1080p/720p HD): Notube 4-step 'mp4hd' / 'mp42k' pipeline (preserves full 1920x1080 resolution & size)
-        - Video (360p/480p SD): Piped muxed MP4 stream relay with automatic fallback to Notube 'mp4' pipeline
+        - Video (360p/480p SD): Notube 'mp4' pipeline with pre-warmed cache reuse
         Returns (succeeded, direct_download_url).
         """
-        ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         ffmpeg_bin = self._binaries["ffmpeg"]
         cached_sd_mp4 = os.path.join(TEMP_STORAGE_DIR, f"cached_full_{video_id}.mp4")
         cached_hd_mp4 = os.path.join(TEMP_STORAGE_DIR, f"cached_full_{video_id}_hd1080.mp4")
+        cached_mp3 = os.path.join(TEMP_STORAGE_DIR, f"cached_audio_{video_id}_mp3.mp3")
 
         try:
-            # 1. Fast path for full audio via Clipto /api/youtube/mp3 relay (~1.5s for full-length audio)
+            # 1. Fast path for full audio via pre-warmed cache or Clipto /api/youtube/mp3 relay (~1.2s)
             if mode == "audio":
                 self._update_job(
                     job_id,
                     stage="DOWNLOADING_FULL_AUDIO",
                     stage_label_en=f"Downloading full-length YouTube {audio_format.upper()} audio stream...",
                     stage_label_hi=f"YouTube से पूरा {audio_format.upper()} ऑडियो डाउनलोड हो रहा है...",
-                    progress=25,
+                    progress=30,
                 )
-                try:
-                    cj = http.cookiejar.CookieJar()
-                    opener = urllib.request.build_opener(
-                        urllib.request.HTTPSHandler(context=self._ssl_ctx),
-                        urllib.request.HTTPCookieProcessor(cj),
-                    )
-                    req_csrf = urllib.request.Request(
-                        "https://www.clipto.com/api/csrf",
-                        headers={
-                            "User-Agent": ua,
-                            "Referer": "https://www.clipto.com/media-downloader/youtube-downloader",
-                        },
-                    )
-                    csrf_data = json.loads(opener.open(req_csrf, timeout=8).read().decode("utf-8", errors="ignore"))
-                    csrf_token = csrf_data.get("csrfToken")
-                    if csrf_token:
-                        mp3_url = (
-                            f"https://www.clipto.com/api/youtube/mp3?"
-                            f"url={urllib.parse.quote(canonical_url)}&csrfToken={urllib.parse.quote(csrf_token)}"
-                        )
-                        req_mp3 = urllib.request.Request(
-                            mp3_url,
-                            headers={
-                                "User-Agent": ua,
-                                "Referer": "https://www.clipto.com/media-downloader/youtube-downloader",
-                            },
-                        )
-                        raw_audio_temp = os.path.join(TEMP_STORAGE_DIR, f"{job_id}_raw_audio.mp3")
-                        with opener.open(req_mp3, timeout=90) as r_mp3:
-                            total_len = int(r_mp3.headers.get("Content-Length") or 0)
-                            downloaded = 0
-                            first_chunk = True
-                            with open(raw_audio_temp, "wb") as out_f:
-                                while True:
-                                    chunk = r_mp3.read(262144)
-                                    if not chunk:
-                                        break
-                                    if first_chunk:
-                                        first_chunk = False
-                                        head_s = chunk[:64].decode("utf-8", errors="ignore").strip().lower()
-                                        if head_s.startswith("<!doctype") or head_s.startswith("<html"):
-                                            raise RuntimeError("HTML response")
-                                    out_f.write(chunk)
-                                    downloaded += len(chunk)
-                                    if total_len > 0:
-                                        pct = min(92, 25 + int((downloaded / total_len) * 67))
-                                        self._update_job(job_id, progress=pct)
-                        if os.path.exists(raw_audio_temp) and os.path.getsize(raw_audio_temp) > 20000:
-                            if audio_format == "mp3":
-                                shutil.move(raw_audio_temp, output_path)
-                            else:
-                                a_cmd = [
-                                    ffmpeg_bin,
-                                    "-y",
-                                    "-i",
-                                    raw_audio_temp,
-                                    "-c:a",
-                                    "aac",
-                                    "-b:a",
-                                    audio_bitrate,
-                                    output_path,
-                                ]
-                                subprocess.run(a_cmd, capture_output=True, timeout=60, check=True)
-                                if os.path.exists(raw_audio_temp):
-                                    try:
-                                        os.remove(raw_audio_temp)
-                                    except OSError:
-                                        pass
-                            return True, mp3_url
-                except Exception:
-                    pass
+                if not (os.path.exists(cached_mp3) and os.path.getsize(cached_mp3) > 20000):
+                    self._prewarm_clipto_mp3(video_id, canonical_url, cached_mp3)
+
+                if os.path.exists(cached_mp3) and os.path.getsize(cached_mp3) > 20000:
+                    if audio_format == "mp3":
+                        self._fast_link_or_copy(cached_mp3, output_path)
+                        return True, None
+                    else:
+                        a_cmd = [
+                            ffmpeg_bin,
+                            "-threads",
+                            "0",
+                            "-y",
+                            "-i",
+                            cached_mp3,
+                            "-c:a",
+                            "aac",
+                            "-b:a",
+                            audio_bitrate,
+                            output_path,
+                        ]
+                        subprocess.run(a_cmd, capture_output=True, timeout=60, check=True)
+                        return True, None
 
                 # Audio fallback via Notube 4-step pipeline
                 nt_audio_fmt = "mp3hd" if audio_format == "mp3" else "m4a"
@@ -1503,6 +1629,7 @@ class MediaEngine:
                     canonical_url=canonical_url,
                     fmt=nt_fmt,
                     dest_path=tier_cache_mp4,
+                    preferred_server=80,
                 )
                 if ok_hd and os.path.exists(tier_cache_mp4) and os.path.getsize(tier_cache_mp4) > 50000:
                     self._update_job(
@@ -1522,7 +1649,7 @@ class MediaEngine:
                 stage="DOWNLOADING_FULL_VIDEO",
                 stage_label_en="Downloading full-length YouTube video & audio stream...",
                 stage_label_hi="YouTube से पूरा वीडियो और ऑडियो डाउनलोड हो रहा है...",
-                progress=18,
+                progress=20,
             )
 
             if not os.path.exists(cached_sd_mp4) or os.path.getsize(cached_sd_mp4) <= 50000:
@@ -1532,6 +1659,7 @@ class MediaEngine:
                     canonical_url=canonical_url,
                     fmt="mp4",
                     dest_path=cached_sd_mp4,
+                    preferred_server=61,
                 )
                 if not ok_sd or not os.path.exists(cached_sd_mp4) or os.path.getsize(cached_sd_mp4) <= 50000:
                     return False, None
@@ -1543,7 +1671,7 @@ class MediaEngine:
                     stage="MERGING_FFMPEG",
                     stage_label_en="Finalizing full-length MP4 container...",
                     stage_label_hi="पूरा वीडियो तैयार किया जा रहा है...",
-                    progress=90,
+                    progress=92,
                 )
                 self._sanitize_mp4_container(cached_sd_mp4, output_path)
                 return True, None
@@ -1558,6 +1686,8 @@ class MediaEngine:
                 if audio_format == "mp3":
                     a_cmd = [
                         ffmpeg_bin,
+                        "-threads",
+                        "0",
                         "-y",
                         "-i",
                         cached_sd_mp4,
@@ -1571,6 +1701,8 @@ class MediaEngine:
                 else:
                     a_cmd = [
                         ffmpeg_bin,
+                        "-threads",
+                        "0",
                         "-y",
                         "-i",
                         cached_sd_mp4,
@@ -1590,16 +1722,34 @@ class MediaEngine:
         """
         Losslessly remuxes only the primary video and audio stream (-map 0:v:0 -map 0:a:0? -c copy)
         with +faststart so attached PNG cover tracks are stripped and mobile players play 100% of the video.
+        Caches sanitized state so repeated requests use instant zero-copy hardlinks (os.link).
         """
-        ffmpeg_bin = self._binaries.get("ffmpeg")
-        if not ffmpeg_bin or not os.path.exists(src_path):
-            if os.path.exists(src_path) and src_path != dst_path:
-                shutil.copyfile(src_path, dst_path)
+        if not os.path.exists(src_path):
             return
+        try:
+            st = os.stat(src_path)
+            sig = (os.path.abspath(src_path), int(st.st_mtime), int(st.st_size))
+        except OSError:
+            sig = None
+
+        with self.lock:
+            already_clean = bool(sig and sig in self.sanitized_files)
+
+        if already_clean:
+            self._fast_link_or_copy(src_path, dst_path)
+            return
+
+        ffmpeg_bin = self._binaries.get("ffmpeg")
+        if not ffmpeg_bin:
+            self._fast_link_or_copy(src_path, dst_path)
+            return
+
         tmp_clean = f"{dst_path}.{uuid.uuid4().hex[:6]}.clean.mp4"
         try:
             cmd = [
                 ffmpeg_bin,
+                "-threads",
+                "0",
                 "-y",
                 "-i",
                 src_path,
@@ -1615,7 +1765,23 @@ class MediaEngine:
             ]
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=60, shell=False)
             if res.returncode == 0 and os.path.exists(tmp_clean) and os.path.getsize(tmp_clean) > 20000:
-                os.replace(tmp_clean, dst_path)
+                if os.path.basename(src_path).startswith("cached_full_") and src_path != dst_path:
+                    os.replace(tmp_clean, src_path)
+                    try:
+                        src_st = os.stat(src_path)
+                        with self.lock:
+                            self.sanitized_files.add((os.path.abspath(src_path), int(src_st.st_mtime), int(src_st.st_size)))
+                    except OSError:
+                        pass
+                    self._fast_link_or_copy(src_path, dst_path)
+                else:
+                    os.replace(tmp_clean, dst_path)
+                    try:
+                        dst_st = os.stat(dst_path)
+                        with self.lock:
+                            self.sanitized_files.add((os.path.abspath(dst_path), int(dst_st.st_mtime), int(dst_st.st_size)))
+                    except OSError:
+                        pass
                 return
         except Exception:
             pass
@@ -1625,8 +1791,7 @@ class MediaEngine:
                     os.remove(tmp_clean)
                 except OSError:
                     pass
-        if src_path != dst_path:
-            shutil.copyfile(src_path, dst_path)
+        self._fast_link_or_copy(src_path, dst_path)
 
     def _download_youtube_scene_frames(self, video_id: str, job_id: str) -> List[str]:
         """Downloads and caches the highest resolution scene frames of the pasted YouTube video."""
@@ -1719,10 +1884,18 @@ class MediaEngine:
                             "node",
                             "--no-playlist",
                             "--no-warnings",
+                            "--concurrent-fragments",
+                            "16",
+                            "--buffer-size",
+                            "1M",
+                            "--http-chunk-size",
+                            "10M",
                             "-f",
                             fmt_selector,
                             "--merge-output-format",
                             "mp4",
+                            "--postprocessor-args",
+                            "ffmpeg:-threads 0 -movflags +faststart",
                             "-o",
                             output_path,
                             canonical_url,
@@ -1736,6 +1909,12 @@ class MediaEngine:
                             "node",
                             "--no-playlist",
                             "--no-warnings",
+                            "--concurrent-fragments",
+                            "16",
+                            "--buffer-size",
+                            "1M",
+                            "--http-chunk-size",
+                            "10M",
                             "-f",
                             "bestaudio/best",
                             "-x",
@@ -1743,6 +1922,8 @@ class MediaEngine:
                             "mp3" if fmt == "mp3" else "m4a",
                             "--audio-quality",
                             job["audio_bitrate"],
+                            "--postprocessor-args",
+                            "ffmpeg:-threads 0",
                             "-o",
                             output_path,
                             canonical_url,
