@@ -12,7 +12,6 @@ Handles:
 
 import http.cookiejar
 import json
-import logging
 import os
 import re
 import shutil
@@ -37,8 +36,6 @@ from backend.security import (
     sanitize_filename,
     validate_and_parse_youtube_url,
 )
-
-logger = logging.getLogger("streamrip.media")
 
 TEMP_STORAGE_DIR = "/tmp/streamrip_pro_media"
 MAX_STORAGE_BYTES = 3000 * 1024 * 1024  # 3000 MB (3 GB) backend storage capacity
@@ -1358,8 +1355,8 @@ class MediaEngine:
                     if (clen > 0 and actual_sz >= clen) or (clen <= 0 and actual_sz > 50000):
                         os.replace(part_path, dest_path)
                         return True, dl_url
-            except Exception as exc:
-                logger.warning("upstream relay server=%s job=%s failure=%s", srv, job_id, type(exc).__name__)
+            except Exception:
+                pass
             finally:
                 if os.path.exists(part_path):
                     try:
@@ -1757,13 +1754,10 @@ class MediaEngine:
                         timeout=PROCESS_TIMEOUT_SECONDS,
                         shell=False,
                     )
-                    if res_yt.returncode != 0:
-                        logger.warning("yt-dlp job=%s exit=%s diagnostic=%s", job_id, res_yt.returncode, classify_yt_dlp_error((res_yt.stderr or "")[-1500:]).get("error_code"))
                     if res_yt.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
                         ytdlp_succeeded = True
                         real_upstream_succeeded = True
-                except Exception as exc:
-                    logger.warning("yt-dlp job=%s exception=%s", job_id, type(exc).__name__)
+                except Exception:
                     ytdlp_succeeded = False
 
             # Step 0b: For real YouTube videos (not synthetic QA reference IDs), download the full-length video/audio stream
@@ -2081,7 +2075,6 @@ class MediaEngine:
                 ),
             )
         except Exception as exc:
-            logger.exception("media pipeline failed job=%s", job_id)
             self.record_error(500)
             if os.path.exists(output_path):
                 try:
