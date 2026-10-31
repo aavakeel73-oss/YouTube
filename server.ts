@@ -197,11 +197,15 @@ async function startServer() {
 
   // Proxy all other /api/* routes directly to the Python 3 backend (preserving binary streams & headers)
   app.use('/api', (req: Request, res: Response) => {
+    req.setTimeout(0);
+    res.setTimeout(0);
+
     const options: http.RequestOptions = {
       hostname: PYTHON_HOST,
       port: PYTHON_TARGET_PORT,
       path: `/api${req.url}`,
       method: req.method,
+      timeout: 0,
       headers: {
         ...req.headers,
         host: `${PYTHON_HOST}:${PYTHON_TARGET_PORT}`,
@@ -219,6 +223,8 @@ async function startServer() {
       res.setHeader('X-Content-Type-Options', 'nosniff');
       proxyRes.pipe(res);
     });
+
+    proxyReq.setTimeout(0);
 
     proxyReq.on('error', (err) => {
       if (!res.headersSent) {
