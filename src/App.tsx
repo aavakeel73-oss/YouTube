@@ -2096,8 +2096,8 @@ docker run -d --name streamrip-pro -p 3000:3000 --restart unless-stopped streamr
             <div className="text-xs text-slate-300 space-y-2">
               <p>
                 {lang === 'hi'
-                  ? 'YouTube क्लाउड डेटासेंटर सर्वर से वीडियो निकालने पर बॉट ब्लॉक (Sign in to confirm you’re not a bot) लगाता है। अपने ब्राउज़र से Export किया हुआ cookies.txt यहाँ पेस्ट करने से सर्वर सीधे 100% ओरिजिनल 1080p वीडियो डाउनलोड कर सकेगा।'
-                  : 'YouTube restricts automated downloads from datacenter IPs. Pasting cookies.txt from a logged-in browser session authorizes yt-dlp to download complete 1080p video streams directly on the server.'}
+                  ? 'YouTube क्लाउड डेटासेंटर सर्वर से वीडियो निकालने पर बॉट ब्लॉक (Sign in to confirm you’re not a bot) लगाता है। ब्राउज़र की लॉगिन कुकीज़ संवेदनशील होती हैं। इन्हें साझा सर्वर पर पेस्ट न करें। HTTP 403 का समाधान सुनिश्चित नहीं है।'
+                  : 'YouTube restricts automated downloads from datacenter IPs. Browser session cookies are sensitive credentials. Do not paste them into a shared server. This does not guarantee resolution of HTTP 403.'}
               </p>
               <p className="text-slate-400">
                 {lang === 'hi'
