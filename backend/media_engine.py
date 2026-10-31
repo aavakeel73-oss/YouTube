@@ -471,51 +471,26 @@ class MediaEngine:
             result["has_real_stream"] = True
             result["tier_stream_bytes"][1080] = hd_size
 
-        # 1. Probe Piped stream relay for full-length downloadable 360p MP4 stream + exact byte size
-        if video_id:
-            try:
-                p_req = urllib.request.Request(
-                    f"https://api.piped.private.coffee/streams/{video_id}",
-                    headers={"User-Agent": ua},
-                )
-                with urllib.request.urlopen(p_req, context=self._ssl_ctx, timeout=4) as p_resp:
-                    p_data = json.loads(p_resp.read().decode("utf-8", errors="ignore"))
-                    p_dur = int(p_data.get("duration") or 0)
-                    if p_dur > 60:
-                        p_dur -= 1
-                    if p_dur > 0:
-                        result["duration_seconds"] = p_dur
-                    if p_data.get("title"):
-                        result["title"] = str(p_data.get("title")).strip()
-                    if p_data.get("uploader"):
-                        result["author"] = str(p_data.get("uploader")).strip()
+        def _extract_tier_height(media_item: Dict[str, Any]) -> int:
+            q_str = str(media_item.get("quality") or media_item.get("qualityLabel") or "")
+            m_q = re.search(r"([0-9]{3,4})p", q_str)
+            if m_q:
+                q_val = int(m_q.group(1))
+                if q_val in (144, 240, 360, 480, 720, 1080, 1440, 2160):
+                    return q_val
+            raw_h = int(media_item.get("height") or 0)
+            raw_w = int(media_item.get("width") or 0)
+            if raw_h > 0 and raw_w > 0 and raw_h > raw_w:
+                return raw_w
+            if raw_h == 1920:
+                return 1080
+            if raw_h == 1280:
+                return 720
+            if raw_h in (854, 640):
+                return 480 if raw_h == 854 else 360
+            return raw_h
 
-                    v_streams = p_data.get("videoStreams") or []
-                    muxed_mp4 = [
-                        v
-                        for v in v_streams
-                        if v.get("format") == "MPEG_4" and not v.get("videoOnly") and v.get("url")
-                    ]
-                    if not muxed_mp4:
-                        muxed_mp4 = [v for v in v_streams if not v.get("videoOnly") and v.get("url")]
-
-                    if muxed_mp4:
-                        best_v = muxed_mp4[0]
-                        v_url = str(best_v["url"])
-                        clen = int(best_v.get("contentLength") or 0)
-                        if clen <= 0:
-                            m_clen = re.search(r"[?&]clen=([0-9]+)", v_url)
-                            if m_clen:
-                                clen = int(m_clen.group(1))
-                        result["has_real_stream"] = True
-                        if clen > 0:
-                            result["real_stream_bytes"] = clen
-                            result["tier_stream_bytes"][360] = clen
-                        self._start_background_prefetch(video_id, v_url, clen)
-            except Exception:
-                pass
-
-        # 2. Fast probe via Clipto YouTube API (~0.7s response time) for full quality ceiling & exact stream clen
+        # Fast probe via Clipto YouTube API (~0.7s response time) for full quality ceiling & exact stream clen
         try:
             c_req = urllib.request.Request(
                 "https://www.clipto.com/api/youtube",
@@ -534,9 +509,9 @@ class MediaEngine:
                     heights = sorted(
                         list(
                             {
-                                int(m.get("height"))
+                                _extract_tier_height(m)
                                 for m in medias
-                                if m.get("type") == "video" and m.get("height")
+                                if m.get("type") == "video" and _extract_tier_height(m) > 0
                             }
                         )
                     )
@@ -563,8 +538,10 @@ class MediaEngine:
                                 break
 
                     for m in medias:
-                        if m.get("type") == "video" and m.get("height") and str(m.get("ext") or "").lower() == "mp4":
-                            h_val = int(m["height"])
+                        if m.get("type") == "video" and str(m.get("ext") or "").lower() == "mp4":
+                            h_val = _extract_tier_height(m)
+                            if h_val <= 0:
+                                continue
                             m_vcl = re.search(r"[?&]clen=([0-9]+)", str(m.get("url") or ""))
                             if m_vcl:
                                 v_clen = int(m_vcl.group(1))
@@ -816,6 +793,8 @@ class MediaEngine:
                     [
                         binaries["yt_dlp"],
                         *cookie_args,
+                        "--js-runtimes",
+                        "node",
                         "--dump-single-json",
                         "--no-playlist",
                         "--no-warnings",
@@ -825,7 +804,7 @@ class MediaEngine:
                     ],
                     capture_output=True,
                     text=True,
-                    timeout=6,
+                    timeout=10,
                     shell=False,
                 )
                 if proc.returncode == 0 and proc.stdout.strip():
@@ -838,7 +817,6 @@ class MediaEngine:
                         self._last_ytdlp_stderr = ytdlp_stderr
             except subprocess.TimeoutExpired:
                 ytdlp_stderr = "yt-dlp subprocess timed out"
-                self._datacenter_ip_blocked = True
                 self._last_ytdlp_stderr = ytdlp_stderr
             except Exception as e:
                 ytdlp_stderr = str(e)
@@ -847,15 +825,40 @@ class MediaEngine:
         if ytdlp_data:
             duration_sec = int(ytdlp_data.get("duration") or 30)
             formats = ytdlp_data.get("formats") or []
-            found_heights = sorted(
-                list(
-                    {
-                        int(f.get("height"))
-                        for f in formats
-                        if f.get("height") and f.get("vcodec") and f.get("vcodec") != "none"
-                    }
-                )
-            )
+            found_heights_set = set()
+            yt_tier_bytes: Dict[int, int] = {}
+            best_audio_bytes = 0
+            for f in formats:
+                if f.get("acodec") and f.get("acodec") != "none" and (not f.get("vcodec") or f.get("vcodec") == "none"):
+                    asz = int(f.get("filesize") or f.get("filesize_approx") or 0)
+                    if str(f.get("ext") or "") == "m4a" and asz > 0:
+                        best_audio_bytes = asz
+                        break
+                    elif asz > best_audio_bytes:
+                        best_audio_bytes = asz
+
+            for f in formats:
+                if f.get("height") and f.get("vcodec") and f.get("vcodec") != "none":
+                    raw_h = int(f.get("height") or 0)
+                    raw_w = int(f.get("width") or 0)
+                    note = str(f.get("format_note") or "")
+                    m_note = re.search(r"([0-9]{3,4})p", note)
+                    if m_note:
+                        norm_h = int(m_note.group(1))
+                    elif raw_w > 0 and raw_h > raw_w:
+                        norm_h = raw_w
+                    else:
+                        norm_h = raw_h
+                    found_heights_set.add(norm_h)
+                    vsz = int(f.get("filesize") or f.get("filesize_approx") or 0)
+                    if vsz > 0 and str(f.get("ext") or "") == "mp4":
+                        has_aud = bool(f.get("acodec") and f.get("acodec") != "none")
+                        tot_sz = vsz if has_aud else (vsz + best_audio_bytes)
+                        vcodec_str = str(f.get("vcodec") or "")
+                        if vcodec_str.startswith("avc1") or norm_h not in yt_tier_bytes:
+                            yt_tier_bytes[norm_h] = tot_sz
+
+            found_heights = sorted(list(found_heights_set))
             avail_tier_heights = [t["height"] for t in QUALITY_TIERS if any(abs(h - t["height"]) <= 20 for h in found_heights)]
             if not avail_tier_heights:
                 avail_tier_heights = [360]
@@ -875,7 +878,12 @@ class MediaEngine:
                 "thumbnail": ytdlp_data.get("thumbnail") or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
                 "extraction_mode": "LIVE_YTDLP_DIRECT",
                 "yt_dlp_diagnostic": None,
-                "qualities": self._build_quality_options(duration_sec, avail_tier_heights),
+                "qualities": self._build_quality_options(
+                    duration_sec,
+                    avail_tier_heights,
+                    real_stream_bytes=yt_tier_bytes.get(360),
+                    tier_stream_bytes=yt_tier_bytes,
+                ),
                 "audio_formats": self._build_audio_options(duration_sec),
                 "analysis_time_ms": elapsed_ms,
             }
@@ -1479,19 +1487,24 @@ class MediaEngine:
 
             # 2. Video Mode: For 720p / 1080p / 1440p / 2160p HD requests, NEVER downgrade to a 360p 25MB stream!
             if mode == "video" and target_height >= 720:
-                if os.path.exists(cached_hd_mp4) and os.path.getsize(cached_hd_mp4) > 50000:
-                    shutil.copyfile(cached_hd_mp4, output_path)
+                nt_fmt = "mp4hd" if target_height <= 1080 else "mp42k"
+                tier_cache_mp4 = (
+                    cached_hd_mp4
+                    if nt_fmt == "mp4hd"
+                    else os.path.join(TEMP_STORAGE_DIR, f"cached_full_{video_id}_{nt_fmt}.mp4")
+                )
+                if os.path.exists(tier_cache_mp4) and os.path.getsize(tier_cache_mp4) > 50000:
+                    self._sanitize_mp4_container(tier_cache_mp4, output_path)
                     return True, None
 
-                nt_fmt = "mp42k" if target_height >= 1440 else "mp4hd"
                 ok_hd, hd_url = self._download_from_notube(
                     job_id=job_id,
                     video_id=video_id,
                     canonical_url=canonical_url,
                     fmt=nt_fmt,
-                    dest_path=cached_hd_mp4,
+                    dest_path=tier_cache_mp4,
                 )
-                if ok_hd and os.path.exists(cached_hd_mp4) and os.path.getsize(cached_hd_mp4) > 50000:
+                if ok_hd and os.path.exists(tier_cache_mp4) and os.path.getsize(tier_cache_mp4) > 50000:
                     self._update_job(
                         job_id,
                         stage="MERGING_FFMPEG",
@@ -1499,11 +1512,11 @@ class MediaEngine:
                         stage_label_hi="पूरा HD वीडियो तैयार किया जा रहा है...",
                         progress=92,
                     )
-                    shutil.copyfile(cached_hd_mp4, output_path)
+                    self._sanitize_mp4_container(tier_cache_mp4, output_path)
                     return True, hd_url
                 return False, None
 
-            # 3. Video Mode (360p / 480p SD) or Audio extraction fallback: try Piped first, then Notube 'mp4'
+            # 3. Video Mode (360p / 480p SD) or Audio extraction fallback via Notube 'mp4'
             self._update_job(
                 job_id,
                 stage="DOWNLOADING_FULL_VIDEO",
@@ -1512,56 +1525,6 @@ class MediaEngine:
                 progress=18,
             )
 
-            with self.lock:
-                stream_info = dict(self.upstream_streams.get(video_id) or {})
-                ev = self.prefetch_events.get(video_id)
-
-            if not os.path.exists(cached_sd_mp4) or os.path.getsize(cached_sd_mp4) <= 50000:
-                if not stream_info.get("video_url") or stream_info.get("failed"):
-                    try:
-                        p_req = urllib.request.Request(
-                            f"https://api.piped.private.coffee/streams/{video_id}",
-                            headers={"User-Agent": ua},
-                        )
-                        with urllib.request.urlopen(p_req, context=self._ssl_ctx, timeout=6) as p_resp:
-                            p_data = json.loads(p_resp.read().decode("utf-8", errors="ignore"))
-                            v_streams = p_data.get("videoStreams") or []
-                            muxed_mp4 = [
-                                v
-                                for v in v_streams
-                                if v.get("format") == "MPEG_4" and not v.get("videoOnly") and v.get("url")
-                            ]
-                            if not muxed_mp4:
-                                muxed_mp4 = [v for v in v_streams if not v.get("videoOnly") and v.get("url")]
-                            if muxed_mp4:
-                                v_url = str(muxed_mp4[0]["url"])
-                                clen = int(muxed_mp4[0].get("contentLength") or 0)
-                                self._start_background_prefetch(video_id, v_url, clen)
-                                with self.lock:
-                                    ev = self.prefetch_events.get(video_id)
-                    except Exception:
-                        pass
-
-                # Poll background prefetch progress if active
-                wait_start = time.time()
-                while ev and not ev.is_set() and (time.time() - wait_start) < 90:
-                    time.sleep(0.25)
-                    with self.lock:
-                        cur_info = self.upstream_streams.get(video_id) or {}
-                        dl_b = int(cur_info.get("downloaded_bytes") or 0)
-                        tot_b = int(cur_info.get("content_length") or 0)
-                    if tot_b > 0 and dl_b > 0:
-                        pct = min(88, max(18, 18 + int((dl_b / tot_b) * 70)))
-                        mb_done = dl_b / (1024 * 1024)
-                        mb_tot = tot_b / (1024 * 1024)
-                        self._update_job(
-                            job_id,
-                            progress=pct,
-                            stage_label_en=f"Downloading full video ({mb_done:.1f} MB / {mb_tot:.1f} MB)...",
-                            stage_label_hi=f"पूरा वीडियो डाउनलोड हो रहा है ({mb_done:.1f} MB / {mb_tot:.1f} MB)...",
-                        )
-
-            # Fallback to Notube 4-step 'mp4' pipeline if Piped failed (e.g. HTTP 500 on Gs97M1BfeEc)
             if not os.path.exists(cached_sd_mp4) or os.path.getsize(cached_sd_mp4) <= 50000:
                 ok_sd, _ = self._download_from_notube(
                     job_id=job_id,
@@ -1582,7 +1545,7 @@ class MediaEngine:
                     stage_label_hi="पूरा वीडियो तैयार किया जा रहा है...",
                     progress=90,
                 )
-                shutil.copyfile(cached_sd_mp4, output_path)
+                self._sanitize_mp4_container(cached_sd_mp4, output_path)
                 return True, None
             else:
                 self._update_job(
@@ -1622,6 +1585,48 @@ class MediaEngine:
                 return False, None
         except Exception:
             return False, None
+
+    def _sanitize_mp4_container(self, src_path: str, dst_path: str) -> None:
+        """
+        Losslessly remuxes only the primary video and audio stream (-map 0:v:0 -map 0:a:0? -c copy)
+        with +faststart so attached PNG cover tracks are stripped and mobile players play 100% of the video.
+        """
+        ffmpeg_bin = self._binaries.get("ffmpeg")
+        if not ffmpeg_bin or not os.path.exists(src_path):
+            if os.path.exists(src_path) and src_path != dst_path:
+                shutil.copyfile(src_path, dst_path)
+            return
+        tmp_clean = f"{dst_path}.{uuid.uuid4().hex[:6]}.clean.mp4"
+        try:
+            cmd = [
+                ffmpeg_bin,
+                "-y",
+                "-i",
+                src_path,
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0?",
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                tmp_clean,
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=60, shell=False)
+            if res.returncode == 0 and os.path.exists(tmp_clean) and os.path.getsize(tmp_clean) > 20000:
+                os.replace(tmp_clean, dst_path)
+                return
+        except Exception:
+            pass
+        finally:
+            if os.path.exists(tmp_clean):
+                try:
+                    os.remove(tmp_clean)
+                except OSError:
+                    pass
+        if src_path != dst_path:
+            shutil.copyfile(src_path, dst_path)
 
     def _download_youtube_scene_frames(self, video_id: str, job_id: str) -> List[str]:
         """Downloads and caches the highest resolution scene frames of the pasted YouTube video."""
@@ -1702,7 +1707,11 @@ class MediaEngine:
                 try:
                     if job["mode"] == "video":
                         h = int(job["target_height"])
-                        fmt_selector = f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/best[height<={h}][ext=mp4]/best[height<={h}]"
+                        fmt_selector = (
+                            f"bestvideo[height<={h}][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/"
+                            f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/"
+                            f"best[height<={h}][ext=mp4]/best[height<={h}]"
+                        )
                         yt_cmd = [
                             ytdlp_bin,
                             *cookie_args,
