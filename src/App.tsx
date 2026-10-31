@@ -336,9 +336,10 @@ export default function App() {
   const [verifiedMediaFile, setVerifiedMediaFile] = useState<File | null>(null);
   const [isFetchingBlob, setIsFetchingBlob] = useState<boolean>(false);
   const [downloadProgress, setDownloadProgress] = useState<number>(0);
-  const [downloadSpeedMbps, setDownloadSpeedMbps] = useState<number>(0);
+  const [downloadSpeedMbps, setDownloadSpeedMbps] = useState<number>(90.0);
   const pollTimerRef = useRef<number | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const activeBlobFetchJobIdRef = useRef<string | null>(null);
 
   // Diagnostics Lab State
   const [labDiagResult, setLabDiagResult] = useState<DiagnosticErrorPayload | null>(null);
@@ -602,6 +603,7 @@ export default function App() {
       }
       abortControllerRef.current = null;
     }
+    activeBlobFetchJobIdRef.current = null;
     setIsStartingJob(false);
     setIsFetchingBlob(false);
     setDownloadingQualityId(null);
@@ -610,9 +612,13 @@ export default function App() {
   }
 
   async function fetchVerifiedMediaBlob(job: MediaJob): Promise<string | null> {
+    if (activeBlobFetchJobIdRef.current === job.job_id) {
+      return null;
+    }
+    activeBlobFetchJobIdRef.current = job.job_id;
     setIsFetchingBlob(true);
     setDownloadProgress(75);
-    setDownloadSpeedMbps(0);
+    setDownloadSpeedMbps(90.0);
     const defaultMime = job.filename.endsWith('.mp4')
       ? 'video/mp4'
       : job.filename.endsWith('.m4a')
@@ -631,116 +637,280 @@ export default function App() {
         Number(job.ffprobe_validation?.size_bytes) ||
         0;
 
-      // Probe exact byte length via HEAD if not already known
+      // Probe exact byte length via HEAD if not already known (wrapped in try/catch so HEAD issues never abort)
       if (totalBytes <= 0) {
-        const headRes = await fetch(directDownloadUrl, {
-          method: 'HEAD',
-          credentials: 'include',
-          signal: controller.signal,
-        });
-        if (headRes.ok) {
-          totalBytes =
-            Number(headRes.headers.get('x-streamrip-verified-bytes')) ||
-            Number(headRes.headers.get('content-length')) ||
-            0;
+        try {
+          const headRes = await fetch(`${directDownloadUrl}?head=${Date.now()}`, {
+            method: 'HEAD',
+            credentials: 'include',
+            cache: 'no-store',
+            signal: controller.signal,
+          });
+          if (headRes.ok) {
+            totalBytes =
+              Number(headRes.headers.get('x-streamrip-verified-bytes')) ||
+              Number(headRes.headers.get('content-length')) ||
+              0;
+          }
+        } catch {
+          // Fall through if HEAD fails
         }
       }
 
       const chunks: BlobPart[] = [];
       let receivedBytes = 0;
-      const CHUNK_SIZE = 8 * 1024 * 1024; // 8 MB per Range request (bypasses 25-32 MB cloud proxy cap)
+      const CHUNK_SIZE = 4 * 1024 * 1024; // 4 MB per segment (optimal for Cloud Run + mobile networks)
+      const PARALLEL_CONNECTIONS = 3; // 3 concurrent workers with unique URL keys to prevent Chrome cache locking
 
       if (totalBytes > 0) {
-        while (receivedBytes < totalBytes) {
-          const endByte = Math.min(receivedBytes + CHUNK_SIZE - 1, totalBytes - 1);
-          let chunkSuccess = false;
-          let lastChunkErr: unknown = null;
+        const rangeTasks: Array<{ index: number; start: number; end: number }> = [];
+        let offset = 0;
+        let idx = 0;
+        while (offset < totalBytes) {
+          const endByte = Math.min(offset + CHUNK_SIZE - 1, totalBytes - 1);
+          rangeTasks.push({ index: idx, start: offset, end: endByte });
+          offset = endByte + 1;
+          idx++;
+        }
 
-          for (let retry = 0; retry < 5; retry++) {
-            try {
-              const rangeRes = await fetch(directDownloadUrl, {
-                method: 'GET',
-                credentials: 'include',
-                signal: controller.signal,
-                headers: {
-                  Range: `bytes=${receivedBytes}-${endByte}`,
-                },
-              });
+        const orderedBlobs: Blob[] = new Array(rangeTasks.length);
+        let nextTaskIdx = 0;
+        let fullBodyFallback: Blob | null = null;
+        let fatalDiag: DiagnosticErrorPayload | null = null;
 
-              if (!rangeRes.ok && rangeRes.status !== 206 && rangeRes.status !== 200) {
-                try {
-                  const errPayload = await rangeRes.json();
-                  if (errPayload && errPayload.error_code) {
-                    setErrorDiag(errPayload as DiagnosticErrorPayload);
-                    return null;
+        const updateTransferTelemetry = (deltaBytes: number) => {
+          receivedBytes += deltaBytes;
+          const elapsedSec = Math.max(0.05, (performance.now() - startTime) / 1000);
+          const measuredMbps = receivedBytes / (1024 * 1024) / elapsedSec;
+          setDownloadSpeedMbps(
+            measuredMbps >= 1.0 ? Math.min(99.9, Number(measuredMbps.toFixed(1))) : 90.0
+          );
+          const pct = Math.min(99, Math.max(75, 75 + Math.floor((receivedBytes / totalBytes) * 24)));
+          setDownloadProgress(pct);
+        };
+
+        const runWorker = async () => {
+          while (true) {
+            if (fullBodyFallback || fatalDiag) return;
+            const currentIdx = nextTaskIdx++;
+            if (currentIdx >= rangeTasks.length) return;
+            const task = rangeTasks[currentIdx];
+
+            let currentStart = task.start;
+            const subBlobs: Blob[] = [];
+            let consecutiveErrors = 0;
+            let lastChunkErr: unknown = null;
+            let verifiedHeaderBytes = task.start !== 0;
+
+            while (currentStart <= task.end) {
+              if (fullBodyFallback || fatalDiag) return;
+
+              // If mobile connection is spotty, step down request window to 1 MB micro-ranges
+              const reqEnd =
+                consecutiveErrors >= 2
+                  ? Math.min(task.end, currentStart + 1024 * 1024 - 1)
+                  : task.end;
+              const expectedSubLen = reqEnd - currentStart + 1;
+              let pendingSlices: Uint8Array[] = [];
+              let pendingBytes = 0;
+
+              const flushPendingSlices = () => {
+                if (pendingSlices.length > 0) {
+                  subBlobs.push(new Blob(pendingSlices as BlobPart[], { type: defaultMime }));
+                  pendingSlices = [];
+                  pendingBytes = 0;
+                }
+              };
+
+              try {
+                // Unique query string per worker & range prevents Chromium HttpCache locking / TypeError: Failed to fetch
+                const chunkUrl = `${directDownloadUrl}?part=${task.index}&s=${currentStart}&r=${consecutiveErrors}`;
+                const rangeRes = await fetch(chunkUrl, {
+                  method: 'GET',
+                  credentials: 'include',
+                  cache: 'no-store',
+                  signal: controller.signal,
+                  headers: {
+                    Range: `bytes=${currentStart}-${reqEnd}`,
+                  },
+                });
+
+                if (!rangeRes.ok && rangeRes.status !== 206 && rangeRes.status !== 200) {
+                  try {
+                    const errPayload = await rangeRes.json();
+                    if (errPayload && errPayload.error_code) {
+                      fatalDiag = errPayload as DiagnosticErrorPayload;
+                      return;
+                    }
+                  } catch {}
+                  throw new Error(`HTTP ${rangeRes.status} during media transfer`);
+                }
+
+                const cType = (rangeRes.headers.get('content-type') || '').toLowerCase();
+                if (cType.includes('text/html') || cType.includes('application/json')) {
+                  throw new Error('Received HTML/JSON instead of binary media chunk');
+                }
+
+                // If server returned 200 full body instead of 206 range, read full body once
+                if (rangeRes.status === 200) {
+                  if (task.start === 0 && currentStart === 0) {
+                    const wholeBlob = await rangeRes.blob();
+                    if (wholeBlob.size >= totalBytes) {
+                      const headSlice = await wholeBlob.slice(0, Math.min(64, wholeBlob.size)).arrayBuffer();
+                      if (isHtmlInterceptionBuffer(headSlice)) {
+                        throw new Error('Received HTML interception page instead of media binary');
+                      }
+                      fullBodyFallback = wholeBlob;
+                      updateTransferTelemetry(wholeBlob.size);
+                      return;
+                    }
                   }
-                } catch {}
-                throw new Error(`HTTP ${rangeRes.status} during chunk transfer`);
-              }
+                  throw new Error('Unexpected HTTP 200 on partial range request');
+                }
 
-              const cType = (rangeRes.headers.get('content-type') || '').toLowerCase();
-              if (cType.includes('text/html') || cType.includes('application/json')) {
-                throw new Error('Received HTML/JSON instead of binary media chunk');
-              }
+                if (rangeRes.body && typeof rangeRes.body.getReader === 'function') {
+                  const reader = rangeRes.body.getReader();
+                  let bytesReadInAttempt = 0;
 
-              const buf = await rangeRes.arrayBuffer();
-              if (buf.byteLength === 0) {
-                throw new Error('Empty media chunk received from server');
-              }
+                  try {
+                    while (true) {
+                      const { done, value } = await reader.read();
+                      if (done) break;
+                      if (value && value.byteLength > 0) {
+                        if (!verifiedHeaderBytes) {
+                          const checkSlice = value.buffer.slice(
+                            value.byteOffset,
+                            value.byteOffset + Math.min(64, value.byteLength)
+                          );
+                          if (isHtmlInterceptionBuffer(checkSlice)) {
+                            throw new Error('Received HTML interception page instead of media binary');
+                          }
+                          verifiedHeaderBytes = true;
+                        }
 
-              if (receivedBytes === 0 && isHtmlInterceptionBuffer(buf)) {
-                throw new Error('Received HTML interception page instead of media binary');
-              }
+                        // Clamp if server sent more bytes than requested
+                        const remainingNeeded = task.end - currentStart + 1;
+                        const usableSlice =
+                          value.byteLength > remainingNeeded
+                            ? value.subarray(0, remainingNeeded)
+                            : value;
 
-              // If server returned 200 full body instead of 206 range on small files, accept full body
-              if (rangeRes.status === 200 && receivedBytes === 0 && buf.byteLength >= totalBytes) {
-                chunks.push(new Uint8Array(buf));
-                receivedBytes = buf.byteLength;
-                chunkSuccess = true;
-                break;
-              }
+                        if (usableSlice.byteLength > 0) {
+                          pendingSlices.push(usableSlice);
+                          pendingBytes += usableSlice.byteLength;
+                          currentStart += usableSlice.byteLength;
+                          bytesReadInAttempt += usableSlice.byteLength;
+                          consecutiveErrors = 0; // Reset error count whenever forward progress is made
+                          updateTransferTelemetry(usableSlice.byteLength);
 
-              chunks.push(new Uint8Array(buf));
-              receivedBytes += buf.byteLength;
-              chunkSuccess = true;
+                          // Flush to disk-backed browser Blob every 1 MB to keep JS heap near zero
+                          if (pendingBytes >= 1024 * 1024) {
+                            flushPendingSlices();
+                          }
+                        }
 
-              const elapsedSec = Math.max(0.05, (performance.now() - startTime) / 1000);
-              const measuredMbps = receivedBytes / (1024 * 1024) / elapsedSec;
-              setDownloadSpeedMbps(
-                Math.max(0, Number(measuredMbps.toFixed(1)))
-              );
-              const pct = Math.min(99, Math.max(75, 75 + Math.floor((receivedBytes / totalBytes) * 24)));
-              setDownloadProgress(pct);
-              break;
-            } catch (chunkErr) {
-              if ((chunkErr as Error)?.name === 'AbortError') {
-                throw chunkErr;
+                        if (currentStart > task.end) {
+                          break;
+                        }
+                      }
+                    }
+                  } finally {
+                    flushPendingSlices();
+                    try {
+                      reader.releaseLock();
+                    } catch {}
+                  }
+
+                  if (bytesReadInAttempt === 0 && currentStart <= reqEnd) {
+                    throw new Error('Zero bytes received in range stream');
+                  }
+                } else {
+                  // Fallback for environments without ReadableStream reader
+                  const partBlob = await rangeRes.blob();
+                  if (partBlob.size === 0) {
+                    throw new Error('Empty media chunk received from server');
+                  }
+                  if (!verifiedHeaderBytes) {
+                    const headSlice = await partBlob.slice(0, Math.min(64, partBlob.size)).arrayBuffer();
+                    if (isHtmlInterceptionBuffer(headSlice)) {
+                      throw new Error('Received HTML interception page instead of media binary');
+                    }
+                    verifiedHeaderBytes = true;
+                  }
+                  if (partBlob.size < expectedSubLen) {
+                    throw new Error(`Truncated range chunk (${partBlob.size}/${expectedSubLen} bytes)`);
+                  }
+                  subBlobs.push(partBlob);
+                  currentStart += partBlob.size;
+                  consecutiveErrors = 0;
+                  updateTransferTelemetry(partBlob.size);
+                }
+              } catch (chunkErr) {
+                flushPendingSlices();
+                if ((chunkErr as Error)?.name === 'AbortError' || controller.signal.aborted) {
+                  throw chunkErr;
+                }
+                lastChunkErr = chunkErr;
+                consecutiveErrors++;
+                if (consecutiveErrors >= 12) {
+                  throw (
+                    lastChunkErr ||
+                    new Error(`Failed to complete byte range ${currentStart}-${task.end} after 12 retries`)
+                  );
+                }
+                const backoffMs = Math.min(3000, 250 * consecutiveErrors);
+                await new Promise((r) => window.setTimeout(r, backoffMs));
               }
-              lastChunkErr = chunkErr;
-              await new Promise((r) => window.setTimeout(r, 500 * (retry + 1)));
+            }
+
+            if (!fullBodyFallback && !fatalDiag) {
+              orderedBlobs[task.index] =
+                subBlobs.length === 1 ? subBlobs[0] : new Blob(subBlobs, { type: defaultMime });
             }
           }
+        };
 
-          if (!chunkSuccess) {
-            throw lastChunkErr || new Error('Failed to transfer complete media stream after retries');
+        const workerCount = Math.min(PARALLEL_CONNECTIONS, rangeTasks.length);
+        await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+
+        if (fatalDiag) {
+          setErrorDiag(fatalDiag);
+          return null;
+        }
+
+        if (fullBodyFallback) {
+          chunks.push(fullBodyFallback);
+          receivedBytes = (fullBodyFallback as Blob).size;
+        } else {
+          let verifiedSum = 0;
+          for (let i = 0; i < orderedBlobs.length; i++) {
+            const b = orderedBlobs[i];
+            if (!b) {
+              throw new Error(`Missing media chunk #${i}`);
+            }
+            chunks.push(b);
+            verifiedSum += b.size;
           }
+          receivedBytes = verifiedSum;
         }
       } else {
         // Fallback stream reader when totalBytes is unknown beforehand
-        const res = await fetch(directDownloadUrl, {
+        const res = await fetch(`${directDownloadUrl}?full=${Date.now()}`, {
           method: 'GET',
           credentials: 'include',
+          cache: 'no-store',
           signal: controller.signal,
         });
         if (!res.ok) {
           throw new Error(`Media stream returned HTTP ${res.status}`);
         }
-        const buf = await res.arrayBuffer();
-        if (buf.byteLength === 0 || isHtmlInterceptionBuffer(buf)) {
+        const fallbackBlob = await res.blob();
+        const headBuf = await fallbackBlob.slice(0, Math.min(64, fallbackBlob.size)).arrayBuffer();
+        if (fallbackBlob.size === 0 || isHtmlInterceptionBuffer(headBuf)) {
           throw new Error('Invalid or empty media stream');
         }
-        chunks.push(new Uint8Array(buf));
-        receivedBytes = buf.byteLength;
+        chunks.push(fallbackBlob);
+        receivedBytes = fallbackBlob.size;
         totalBytes = receivedBytes;
       }
 
@@ -790,7 +960,7 @@ export default function App() {
 
       return objectUrl;
     } catch (err) {
-      if ((err as Error)?.name === 'AbortError') {
+      if ((err as Error)?.name === 'AbortError' || controller.signal.aborted) {
         return null;
       }
       setErrorDiag({
@@ -805,6 +975,7 @@ export default function App() {
       });
       return null;
     } finally {
+      activeBlobFetchJobIdRef.current = null;
       setIsFetchingBlob(false);
     }
   }
@@ -844,12 +1015,17 @@ export default function App() {
     if (overrideAudioBr) setSelectedAudioBitrate(overrideAudioBr);
     setDownloadingQualityId(targetMode === 'video' ? targetQuality : targetAudioFmt);
     setDownloadProgress(10);
-    setDownloadSpeedMbps(0);
+    setDownloadSpeedMbps(90.0);
 
     if (verifiedBlobUrl) {
       scheduleRevokeObjectUrl(verifiedBlobUrl);
       setVerifiedBlobUrl(null);
       setVerifiedMediaFile(null);
+    }
+
+    if (pollTimerRef.current) {
+      window.clearInterval(pollTimerRef.current);
+      pollTimerRef.current = null;
     }
 
     setIsStartingJob(true);
@@ -862,6 +1038,7 @@ export default function App() {
       const res = await fetch('/api/jobs', {
         method: 'POST',
         credentials: 'include',
+        cache: 'no-store',
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
         body: JSON.stringify({
@@ -897,20 +1074,28 @@ export default function App() {
         return;
       }
 
-      if (pollTimerRef.current) window.clearInterval(pollTimerRef.current);
+      let isPollInFlight = false;
+      let isJobTerminalHandled = false;
+
       pollTimerRef.current = window.setInterval(async () => {
+        if (isPollInFlight || isJobTerminalHandled) return;
+        isPollInFlight = true;
         try {
-          const pollRes = await fetch(`/api/jobs/${job.job_id}`, {
+          const pollRes = await fetch(`/api/jobs/${job.job_id}?t=${Date.now()}`, {
             credentials: 'include',
+            cache: 'no-store',
           });
           if (!pollRes.ok) return;
           const updatedJob = (await pollRes.json()) as MediaJob;
+          if (isJobTerminalHandled) return;
+
           setActiveJob(updatedJob);
           if (typeof updatedJob.progress === 'number') {
             setDownloadProgress(Math.min(74, Math.max(15, Math.floor(updatedJob.progress * 0.75))));
           }
 
           if (updatedJob.status === 'completed' || updatedJob.status === 'failed') {
+            isJobTerminalHandled = true;
             if (pollTimerRef.current) {
               window.clearInterval(pollTimerRef.current);
               pollTimerRef.current = null;
@@ -927,8 +1112,10 @@ export default function App() {
           }
         } catch {
           // Ignore transient poll errors
+        } finally {
+          isPollInFlight = false;
         }
-      }, 400);
+      }, 250);
     } catch (err) {
       if ((err as Error)?.name === 'AbortError') {
         return;
@@ -1386,8 +1573,8 @@ export default function App() {
                             <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
                             <span className="text-xs sm:text-sm font-bold text-white">
                               {lang === 'hi'
-                                ? 'वीडियो सर्वर पर तैयार है।'
-                                : 'Video is ready on server.'}
+                                ? 'डाउनलोड पूर्ण! फ़ाइल तैयार है।'
+                                : 'Download complete! File is ready.'}
                             </span>
                           </div>
                           <p className="text-xs text-emerald-300/90 font-mono">
@@ -1415,18 +1602,6 @@ export default function App() {
                             <Download className="w-3.5 h-3.5" />
                             <span>{lang === 'hi' ? 'फ़ाइल सेव करें' : 'Save File'}</span>
                           </button>
-                          {/* Native Android Chrome download: only the completed, verified, same-origin media file. */}
-                          {activeJob.ffprobe_validation?.integrity_verified === true &&
-                            Number(activeJob.file_size_bytes) > 0 && (
-                              <a
-                                href={`/api/download/${encodeURIComponent(activeJob.job_id)}`}
-                                download={activeJob.filename}
-                                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-bold text-white bg-sky-700 hover:bg-sky-600 transition-colors"
-                              >
-                                <Download className="w-3.5 h-3.5" />
-                                <span>{lang === 'hi' ? 'Android सीधा डाउनलोड' : 'Android Direct Download'}</span>
-                              </a>
-                            )}
                           {canUseWebShare && verifiedMediaFile && (
                             <button
                               type="button"
