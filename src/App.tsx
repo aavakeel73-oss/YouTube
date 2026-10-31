@@ -338,8 +338,6 @@ export default function App() {
   const [downloadProgress, setDownloadProgress] = useState<number>(0);
   const [downloadSpeedMbps, setDownloadSpeedMbps] = useState<number>(0);
   const pollTimerRef = useRef<number | null>(null);
-  const pollBusyRef = useRef(false);
-  const pollErrorsRef = useRef(0);
   const abortControllerRef = useRef<AbortController | null>(null);
 
   // Diagnostics Lab State
@@ -709,7 +707,7 @@ export default function App() {
               const elapsedSec = Math.max(0.05, (performance.now() - startTime) / 1000);
               const measuredMbps = receivedBytes / (1024 * 1024) / elapsedSec;
               setDownloadSpeedMbps(
-                measuredMbps >= 0.5 ? Math.min(99.9, Number(measuredMbps.toFixed(1))) : 90.0
+                Math.max(0, Number(measuredMbps.toFixed(1)))
               );
               const pct = Math.min(99, Math.max(75, 75 + Math.floor((receivedBytes / totalBytes) * 24)));
               setDownloadProgress(pct);
@@ -894,67 +892,43 @@ export default function App() {
         return;
       }
       if (job.status === 'failed') {
-        setDownloadProgress(0);
-        setDownloadSpeedMbps(0);
         setDownloadingQualityId(null);
         if (job.error) setErrorDiag(job.error);
         return;
       }
 
       if (pollTimerRef.current) window.clearInterval(pollTimerRef.current);
-      pollBusyRef.current = false;
-      pollErrorsRef.current = 0;
       pollTimerRef.current = window.setInterval(async () => {
-        if (pollBusyRef.current) return;
-        pollBusyRef.current = true;
         try {
-          const pollRes = await fetch(`/api/jobs/${job.job_id}`, { credentials: 'include' });
-          if (!pollRes.ok) throw new Error(`Job status HTTP ${pollRes.status}`);
+          const pollRes = await fetch(`/api/jobs/${job.job_id}`, {
+            credentials: 'include',
+          });
+          if (!pollRes.ok) return;
           const updatedJob = (await pollRes.json()) as MediaJob;
-          pollErrorsRef.current = 0;
           setActiveJob(updatedJob);
-          if (updatedJob.status === 'failed' || updatedJob.status === 'completed') {
-            if (pollTimerRef.current !== null) window.clearInterval(pollTimerRef.current);
-            pollTimerRef.current = null;
+          if (typeof updatedJob.progress === 'number') {
+            setDownloadProgress(Math.min(74, Math.max(15, Math.floor(updatedJob.progress * 0.75))));
+          }
+
+          if (updatedJob.status === 'completed' || updatedJob.status === 'failed') {
+            if (pollTimerRef.current) {
+              window.clearInterval(pollTimerRef.current);
+              pollTimerRef.current = null;
+            }
             if (updatedJob.status === 'completed') {
               await fetchVerifiedMediaBlob(updatedJob);
               setDownloadingQualityId(null);
             } else {
-              setDownloadProgress(0);
-              setDownloadSpeedMbps(0);
               setDownloadingQualityId(null);
-              setErrorDiag(updatedJob.error || {
-                http_status: 502,
-                error_code: 'DOWNLOAD_FAILED',
-                title_en: 'Download failed',
-                message_en: 'The server could not complete this download.',
-              } as DiagnosticErrorPayload);
+              if (updatedJob.error) {
+                setErrorDiag(updatedJob.error);
+              }
             }
-            return;
           }
-          if (typeof updatedJob.progress === 'number') {
-            setDownloadProgress(Math.min(74, Math.max(0, Math.floor(updatedJob.progress * 0.75))));
-          }
-        } catch (err) {
-          pollErrorsRef.current += 1;
-          if (pollErrorsRef.current >= 5) {
-            if (pollTimerRef.current !== null) window.clearInterval(pollTimerRef.current);
-            pollTimerRef.current = null;
-            setActiveJob(null);
-            setDownloadingQualityId(null);
-            setDownloadProgress(0);
-            setDownloadSpeedMbps(0);
-            setErrorDiag({
-              http_status: 503,
-              error_code: 'STATUS_CHECK_FAILED',
-              title_en: 'Connection interrupted',
-              message_en: 'Unable to check download status after five attempts. Please try again.',
-            } as DiagnosticErrorPayload);
-          }
-        } finally {
-          pollBusyRef.current = false;
+        } catch {
+          // Ignore transient poll errors
         }
-      }, 1500);
+      }, 400);
     } catch (err) {
       if ((err as Error)?.name === 'AbortError') {
         return;
@@ -1412,8 +1386,8 @@ export default function App() {
                             <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
                             <span className="text-xs sm:text-sm font-bold text-white">
                               {lang === 'hi'
-                                ? 'डाउनलोड पूर्ण! फ़ाइल तैयार है।'
-                                : 'Download complete! File is ready.'}
+                                ? 'वीडियो सर्वर पर तैयार है।'
+                                : 'Video is ready on server.'}
                             </span>
                           </div>
                           <p className="text-xs text-emerald-300/90 font-mono">
@@ -1441,6 +1415,18 @@ export default function App() {
                             <Download className="w-3.5 h-3.5" />
                             <span>{lang === 'hi' ? 'फ़ाइल सेव करें' : 'Save File'}</span>
                           </button>
+                          {/* Native Android Chrome download: only the completed, verified, same-origin media file. */}
+                          {activeJob.ffprobe_validation?.integrity_verified === true &&
+                            Number(activeJob.file_size_bytes) > 0 && (
+                              <a
+                                href={`/api/download/${encodeURIComponent(activeJob.job_id)}`}
+                                download={activeJob.filename}
+                                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-bold text-white bg-sky-700 hover:bg-sky-600 transition-colors"
+                              >
+                                <Download className="w-3.5 h-3.5" />
+                                <span>{lang === 'hi' ? 'Android सीधा डाउनलोड' : 'Android Direct Download'}</span>
+                              </a>
+                            )}
                           {canUseWebShare && verifiedMediaFile && (
                             <button
                               type="button"
