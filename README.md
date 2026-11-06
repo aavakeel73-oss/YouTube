@@ -1,78 +1,48 @@
-# StreamRip Pro — Professional Full-Stack YouTube Media Processor (2026)
+# StreamRip Independent — HTML/CSS/JS + Flask + yt-dlp + FFmpeg
 
-StreamRip Pro is a full-stack YouTube media analysis, video+audio stream merging, and audio extraction workstation built for authorized, user-owned, Creative Commons, and public-domain media.
+A newly written, independent interface inspired by the **general** analyze → convert → status → file workflow observed in publicly delivered YT1D frontend assets. No YT1D source files, images, logos, or proprietary code are included.
 
-## 1. Architecture & Stack
+## Features
+- HTTPS YouTube URL analysis with available source heights
+- MP4 video/audio selection and MP3 extraction
+- Flask JSON API; background jobs and polling; FFmpeg merge via yt-dlp
+- Server-side bytes/speed/ETA when yt-dlp reports them; distinct postprocessing stage
+- Final file download with HTTP range support via Flask `send_file(conditional=True)`
+- Mobile-first interface; automatic browser download attempt with manual fallback
 
-- **Frontend**: Responsive Mobile-First React 19 + TypeScript + Tailwind CSS (plus standalone HTML5/CSS3/JS reference in `/frontend`), featuring full **English & Hindi (हिन्दी)** bilingual localization.
-- **Gateway**: Express + Vite middleware (`server.ts`) on port `3000` with streaming binary proxy to the Python 3 media engine.
-- **Backend Media Engine**: Python 3 (`backend/app.py`, `backend/media_engine.py`, `backend/security.py`, `backend/diagnostics.py`) powered by:
-  - `yt-dlp` (`./bin/yt-dlp` or system `yt-dlp`)
-  - `FFmpeg` (`/usr/bin/ffmpeg`) for video+audio stream merging (`-c:v copy -c:a aac -movflags +faststart`) and audio encoding (`libmp3lame`, `aac`)
-  - `FFprobe` (`/usr/bin/ffprobe`) for post-processing container & stream integrity verification
+## Local setup
+Python 3.11+ and FFmpeg/FFprobe must be installed and available on PATH.
 
-## 2. Project Folder Structure
-
-```text
-/
-├── backend/
-│   ├── __init__.py          # Backend package marker
-│   ├── app.py               # Python 3 multi-threaded REST API server & QA suite runner
-│   ├── diagnostics.py       # HTTP 400/403/404/408/429/500/502/503 & 6-way YT 403 classifier
-│   ├── media_engine.py      # yt-dlp discovery, FFmpeg merge/extract, FFprobe validation
-│   └── security.py          # URL allowlisting, SSRF guard, filename sanitizer, rate limiter
-├── bin/
-│   └── yt-dlp               # Standalone Linux yt-dlp binary
-├── frontend/
-│   ├── index.html           # Standalone HTML5 client
-│   ├── styles.css           # Standalone CSS3 dark glassmorphic stylesheet
-│   └── app.js               # Standalone JavaScript API client
-├── src/
-│   ├── App.tsx              # Full-featured bilingual React 19 workstation UI
-│   ├── i18n.ts              # English & Hindi translations
-│   ├── index.css            # Tailwind CSS & custom glassmorphism utilities
-│   └── main.tsx             # React entry point
-├── tests/
-│   └── test_backend.py      # Automated unittest suite covering 12 QA scenarios
-├── server.ts                # Node/Express full-stack gateway & Python process manager
-├── requirements.txt         # Python dependencies
-├── Dockerfile               # Multi-stage production container (Node 22 + Python 3.12 + FFmpeg)
-├── .dockerignore            # Docker build exclusions
-└── .env.example             # Environment variable template
-```
-
-## 3. Cloud Deployment Instructions
-
-### A. Google Cloud Run
 ```bash
-gcloud builds submit --tag gcr.io/YOUR_PROJECT_ID/streamrip-pro
-gcloud run deploy streamrip-pro \
-  --image gcr.io/YOUR_PROJECT_ID/streamrip-pro \
-  --platform managed \
-  --region asia-northeast1 \
-  --allow-unauthenticated \
-  --memory 2Gi \
-  --cpu 2 \
-  --timeout 300s \
-  --port 3000
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python app.py
 ```
+Open http://localhost:5000
 
-### B. Railway
-1. Connect repository to Railway.
-2. Railway automatically detects the `Dockerfile`.
-3. Set environment variables: `PORT=3000`, `PYTHON_BACKEND_PORT=5001`.
+On Windows use `.venv\\Scripts\\activate` instead of `source`.
 
-### C. Render
-1. Create a new **Web Service** on Render and select **Docker** runtime.
-2. Configure Health Check Path to `/api/health`.
-3. Note: Free Render instances spin down after inactivity and have ephemeral `/tmp` storage.
+## Render deployment (Android mobile / GitHub)
+1. Unzip the project. Upload the **contents** of `StreamRip_Independent/` into a new GitHub repository root (not just the outer ZIP).
+2. Render → New → Blueprint → connect your GitHub repository → approve `render.yaml`.
+3. Render builds Dockerfile with FFmpeg and runs `waitress-serve` on the Render-provided `PORT`.
+4. Visit `/api/health` to confirm `ffmpeg: true`, then test a video you are permitted to download.
 
-### D. Docker-Based VPS
-```bash
-docker build -t streamrip-pro:latest .
-docker run -d --name streamrip-pro -p 3000:3000 --restart unless-stopped streamrip-pro:latest
-```
+Alternative: New Web Service → Docker runtime → repo root → use Dockerfile. `render.yaml` is optional for this route.
 
-## 4. Platform Limitations & Ethical Compliance
-- StreamRip Pro strictly complies with platform rules: it **does not** implement DRM bypassing, CAPTCHA evasion, BotGuard bypassing, proxy rotation, or unauthorized cookie harvesting.
-- Shared cloud datacenter IPs (Cloud Run, AWS, Render, Railway) are frequently challenged by YouTube (`HTTP 403 — Hosting Environment Restriction`). StreamRip Pro detects and classifies these restrictions transparently without faking availability.
+## API
+- `GET /api/health`
+- `POST /api/analyze` JSON `{"url":"https://www.youtube.com/watch?v=..."}`
+- `POST /api/jobs` JSON `{"url":"...","quality":"720","mode":"mp4"}` (or `"mode":"mp3"`)
+- `GET /api/jobs/<id>` (status)
+- `GET /api/files/<id>` (download after complete)
+
+## Limitations / important deployment notes
+- **No guarantee** YouTube downloads work from Render/cloud datacenter IPs. YouTube may require sign-in, throttle, return 403, or disallow a video. Do not attempt to circumvent access controls.
+- Free Render has limited CPU, RAM, ephemeral disk, sleeps on inactivity, and may restart; jobs and files disappear on restart. This prototype uses in-memory jobs and temporary local storage. Multiple replicas do not share state. For production use Redis/Celery/RQ + object storage, durable database, rate limits, auth, storage quotas and cleanup scheduler.
+- Server retrieval progress is **not** browser-to-phone download progress. Unknown total bytes show `—` instead of a fabricated percentage. Postprocessing progress is a stage estimate, not FFmpeg frame-level progress.
+- Final MP4 can have a different size than estimated streams. Final size is shown only after processing.
+- `max_filesize` is a best-effort yt-dlp limit; the final file is also checked. Default 350 MB and 30 minutes; configure via env vars.
+- The project does not implement cookies or user authentication; do not upload private cookies to a public server.
+- Only use with media you own or have permission to download and follow applicable platform terms and law.
